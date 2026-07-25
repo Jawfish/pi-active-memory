@@ -30,16 +30,16 @@ Influenced by the strongest ideas in `pi-hermes-memory`, `pi-semantic-memory`, `
 
 ## Install
 
-From a published package:
+From GitHub (pinning a release is recommended):
 
 ```bash
-pi install npm:pi-active-memory
+pi install git:github.com/Rizhiy/pi-active-memory@v1.0.0
 ```
 
 From a checkout:
 
 ```bash
-git clone https://github.com/rizhiy/pi-active-memory.git
+git clone https://github.com/Rizhiy/pi-active-memory.git
 cd pi-active-memory
 npm install
 pi install "$(pwd)"
@@ -312,7 +312,7 @@ The extension is TypeScript loaded directly by Pi through its package manifest; 
 
 ## Releasing
 
-Releases use Conventional Commits and semantic-release on every push to `main`:
+Releases use Conventional Commits and semantic-release on every push to `master`:
 
 | Commit                                      | Release         |
 | ------------------------------------------- | --------------- |
@@ -321,18 +321,7 @@ Releases use Conventional Commits and semantic-release on every push to `main`:
 | `feat!: ...` or a `BREAKING CHANGE:` footer | major           |
 | `docs:`, `test:`, `chore:`, `refactor:`     | none by default |
 
-A release updates `package.json`, `package-lock.json`, and `CHANGELOG.md`, creates a Git tag and GitHub release, then publishes to npm with provenance.
-
-Repository setup:
-
-1. Replace `your-name` in `package.json` and this README.
-2. Push the repository to GitHub with `main` as the release branch.
-3. For the first release, create a granular npm token allowed to publish `pi-active-memory` and add it as the repository secret `NPM_TOKEN`.
-4. Push a Conventional Commit to `main`; the first semantic-release publication is `1.0.0` when no prior release tag exists.
-5. In the new npm package's **Settings → Trusted Publisher**, select GitHub Actions and enter the repository owner/name plus workflow `release.yml`. Then delete `NPM_TOKEN`; later releases use short-lived OIDC credentials.
-6. Ensure Actions can write repository contents. If `main` is protected, allow this workflow to push its version commit and tag.
-
-The workflow grants `id-token: write` for npm trusted publishing and provenance. Before relying on CI, verify package contents with `npm pack --dry-run`.
+A release updates `package.json`, `package-lock.json`, and `CHANGELOG.md`, then creates a Git tag and GitHub release. It does not publish to npm.
 
 ## License
 

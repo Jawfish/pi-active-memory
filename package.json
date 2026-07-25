@@ -55,11 +55,12 @@
   "engines": {
     "node": ">=20"
   },
-  "publishConfig": {
-    "access": "public"
-  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/rizhiy/pi-active-memory.git"
+    "url": "git+https://github.com/Rizhiy/pi-active-memory.git"
+  },
+  "homepage": "https://github.com/Rizhiy/pi-active-memory#readme",
+  "bugs": {
+    "url": "https://github.com/Rizhiy/pi-active-memory/issues"
   }
 }
