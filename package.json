@@ -56,11 +56,10 @@
     "node": ">=20"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-name/pi-active-memory.git"
+    "url": "https://github.com/rizhiy/pi-active-memory.git"
   }
 }

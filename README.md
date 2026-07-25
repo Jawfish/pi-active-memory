@@ -39,7 +39,7 @@ pi install npm:pi-active-memory
 From a checkout:
 
 ```bash
-git clone https://github.com/your-name/pi-active-memory.git
+git clone https://github.com/rizhiy/pi-active-memory.git
 cd pi-active-memory
 npm install
 pi install "$(pwd)"
@@ -217,11 +217,11 @@ Assistant-caused candidates follow a separate, stricter path. The active investi
 
 Accepted categories:
 
-| Kind | Sources and examples |
-|---|---|
-| `user_profile` | User only: identity, occupation, stable preferences, working style |
-| `fact` | User-stated facts or hard-won assistant investigation conclusions/locations |
-| `skill_workflow` | User-taught workflows or difficult assistant-discovered procedures |
+| Kind             | Sources and examples                                                        |
+| ---------------- | --------------------------------------------------------------------------- |
+| `user_profile`   | User only: identity, occupation, stable preferences, working style          |
+| `fact`           | User-stated facts or hard-won assistant investigation conclusions/locations |
+| `skill_workflow` | User-taught workflows or difficult assistant-discovered procedures          |
 
 Every write performs vector search first. A model then chooses add, replace, or no-op. Source history is retained on updates, and assistant content is prevented from replacing a user-sourced claim.
 
@@ -249,16 +249,16 @@ The editor exposes JSON fields for `text`, `kind`, `scope`, `projectId`, `confid
 
 ## Commands
 
-| Command | Purpose |
-|---|---|
-| `/memory-status` | Provider/store health, counters, latest error and latest recall |
-| `/memory` | Fuzzy-find a memory, then edit or delete it |
-| `/memory-edit` | Fuzzy-find and edit a memory's text or metadata |
-| `/memory-list [global\|project]` | Inspect active memories and their IDs |
-| `/memory-forget [id-or-prefix]` | Fuzzy-find and soft-delete a memory, or delete by a unique ID prefix |
-| `/memory-why` | Show IDs, scores, and reason behind the latest steer |
-| `/memory-pause` | Pause automatic capture and recall for this session |
-| `/memory-resume` | Resume automation |
+| Command                          | Purpose                                                              |
+| -------------------------------- | -------------------------------------------------------------------- |
+| `/memory-status`                 | Provider/store health, counters, latest error and latest recall      |
+| `/memory`                        | Fuzzy-find a memory, then edit or delete it                          |
+| `/memory-edit`                   | Fuzzy-find and edit a memory's text or metadata                      |
+| `/memory-list [global\|project]` | Inspect active memories and their IDs                                |
+| `/memory-forget [id-or-prefix]`  | Fuzzy-find and soft-delete a memory, or delete by a unique ID prefix |
+| `/memory-why`                    | Show IDs, scores, and reason behind the latest steer                 |
+| `/memory-pause`                  | Pause automatic capture and recall for this session                  |
+| `/memory-resume`                 | Resume automation                                                    |
 
 ## Activity debug log
 
@@ -314,12 +314,12 @@ The extension is TypeScript loaded directly by Pi through its package manifest; 
 
 Releases use Conventional Commits and semantic-release on every push to `main`:
 
-| Commit | Release |
-|---|---|
-| `fix: ...` | patch |
-| `feat: ...` | minor |
-| `feat!: ...` or a `BREAKING CHANGE:` footer | major |
-| `docs:`, `test:`, `chore:`, `refactor:` | none by default |
+| Commit                                      | Release         |
+| ------------------------------------------- | --------------- |
+| `fix: ...`                                  | patch           |
+| `feat: ...`                                 | minor           |
+| `feat!: ...` or a `BREAKING CHANGE:` footer | major           |
+| `docs:`, `test:`, `chore:`, `refactor:`     | none by default |
 
 A release updates `package.json`, `package-lock.json`, and `CHANGELOG.md`, creates a Git tag and GitHub release, then publishes to npm with provenance.
 
