@@ -30,10 +30,16 @@ Influenced by the strongest ideas in `pi-hermes-memory`, `pi-semantic-memory`, `
 
 ## Install
 
-From GitHub (pinning a release is recommended):
+Install the latest release from [npm](https://www.npmjs.com/package/pi-active-memory):
 
 ```bash
-pi install git:github.com/Rizhiy/pi-active-memory@v1.0.0
+pi install npm:pi-active-memory
+```
+
+To pin the current release:
+
+```bash
+pi install npm:pi-active-memory@0.1.0
 ```
 
 From a checkout:
