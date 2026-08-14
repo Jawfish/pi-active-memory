@@ -17,7 +17,10 @@ user/long investigation ──► fast validation model ──► embeddings ─
 - Assistant-sourced memories are allowed only after a substantial investigation lasting at least one minute. A separate validator rejects common knowledge, simple-search results, routine facts, plans, progress, and guesses.
 - Every record stores its actor, session ID, cause, storage rationale, evidence, confidence, and elapsed investigation time where applicable. Legacy records are upgraded on startup with explicit migration provenance rather than leaving fields absent.
 - Searches for related memories before every automatic or explicit write, then chooses add, update, or no-op. Assistant findings cannot overwrite user-sourced claims.
-- Assistant findings have capped confidence and lower ranking priority than user-caused memories.
+- New memories start at neutral usefulness confidence. Bounded, steer-bound `memory_feedback` raises or lowers future ranking while preventing duplicate and runaway reinforcement.
+- Assistant findings retain lower ranking priority than user-caused memories.
+- Memories expire by elapsed time, inactive-session count, or very low confidence. Relevant recall and useful feedback extend both expiry budgets; expiry is a recoverable soft deletion with an audit reason.
+- User-only `/memory-compact` reviews one related pair at a time before consolidating it; it never merges across scope, kind, project, or user/assistant authority.
 - Supports global and project-scoped memories through metadata filters.
 - Recalls before a new agent run and periodically during longer tool/reasoning loops.
 - Uses Pi custom messages, so memory steers are visibly different from user messages.
@@ -144,6 +147,31 @@ Project values are deep-merged over global values. Project configuration is read
     "priority": 0.55,
     "similarityThreshold": 0.78
   },
+  "memoryLifecycle": {
+    "enabled": true,
+    "confidence": {
+      "initial": 0.5,
+      "deletionThreshold": 0.1,
+      "minimum": 0.05,
+      "maximum": 0.95,
+      "usefulDelta": 0.1,
+      "unhelpfulDelta": 0.15
+    },
+    "decay": {
+      "initialRate": 0.28,
+      "minimumRate": 0,
+      "maximumRate": 0.95,
+      "usefulDelta": 0.05
+    },
+    "feedback": {
+      "maxPerMemoryPerSession": 2,
+      "historyLimit": 50
+    }
+  },
+  "compaction": {
+    "similarityThreshold": 0.5,
+    "maximumProposals": 10
+  },
   "recall": {
     "enabled": true,
     "topK": 10,
@@ -152,6 +180,9 @@ Project values are deep-merged over global values. Project configuration is read
     "everyToolResults": 4,
     "thinkingCharacters": 1200,
     "cooldownMs": 15000,
+    "perMemoryCooldownMs": 1800000,
+    "perMemoryTurnCooldown": 4,
+    "maxSteersPerMemoryPerSession": 2,
     "minVectorScore": 0.28,
     "minimumMemoryAgeMinutes": 30
   },
@@ -243,6 +274,10 @@ Semantic search with `global`, `project`, or `both` scope. Results include actor
 
 Stores a hard-won assistant result only during an active investigation that has exceeded the configured time gate. The tool requires calibrated confidence and a rationale, then independently validates, searches, and merges before writing. Long investigations are also considered automatically when the agent settles.
 
+### `memory_feedback`
+
+Rates one exact memory from one exact steer as `useful` or `unhelpful`, with a concrete reason. The tool requires the unguessable token included in that steer, accepts each token/memory pair once, and caps feedback per memory per session. Useful feedback raises confidence and renews lifecycle budgets; unhelpful feedback lowers confidence without renewing it. Full feedback provenance is retained in bounded history.
+
 ### `memory_forget`
 
 Soft-delete by exact memory ID. Deleted records remain in storage for audit/recovery but are excluded from automatic and manual search.
@@ -262,7 +297,9 @@ The editor exposes JSON fields for `text`, `kind`, `scope`, `projectId`, `confid
 | `/memory-edit`                   | Fuzzy-find and edit a memory's text or metadata                      |
 | `/memory-list [global\|project]` | Inspect active memories and their IDs                                |
 | `/memory-forget [id-or-prefix]`  | Fuzzy-find and soft-delete a memory, or delete by a unique ID prefix |
-| `/memory-why`                    | Show IDs, scores, and reason behind the latest steer                 |
+| `/memory-compact`                | Review related pairs and combine selected memories                    |
+| `/memory-settings`               | Configure extension settings, including compaction similarity         |
+| `/memory-why`                    | Show IDs, scores, feedback token, and latest steer reason            |
 | `/memory-pause`                  | Pause automatic capture and recall for this session                  |
 | `/memory-resume`                 | Resume automation                                                    |
 
@@ -280,6 +317,16 @@ The activity file records ordered lifecycle, capture, extraction, evidence rejec
 The logger serializes appends through one write queue and forces permissions to `0600`. If Pi is running with `--no-session`, there is no session path and no activity file is created.
 
 Set `activityLog.enabled` to `false` to disable it. Set `activityLog.includeText` to `false` to preserve IDs, scores, scopes, kinds, decisions, counts, models, and errors while omitting user text, memory text, queries, reasons, and steer instructions.
+
+## Compaction, feedback, and forgetting
+
+`/memory-compact` is deliberately command-only: there is no automatic trigger and no LLM-callable compaction tool. It embeds active memories, partitions them by scope, project, kind, and actor authority, then offers disjoint pairs whose vector similarity clears the configured threshold (default `0.5`). Change the user-level threshold through `/memory-settings`; it is persisted in `~/.pi/agent/active-memory.json` and can still be overridden by trusted project configuration. The review shows only the two memory texts, asks whether to combine them, and then offers the proposed combined text for editing. The fast model and final validation must preserve every source claim. The replacement takes the maximum source confidence and priority, keeps the slowest source decay rate, retains all source provenance and IDs, and marks source records `superseded` rather than deleting them.
+
+Existing memory plugins were reviewed before implementing this path. Mem0 Dream uses its own backend and retention model, while `pi-hermes-memory` owns Markdown/SQLite memory and can auto-consolidate on overflow. Installing either alongside this extension would duplicate stores, weaken this package's provenance/authority guarantees, or violate the user-only trigger requirement, so compaction is integrated natively instead.
+
+Forgetting is unified with confidence. On the first lifecycle sweep of each UTC calendar day, each active memory catches up multiplicatively: `confidence *= (1 - decayRate) ^ elapsedUnusedDays`. The extension sweeps at session start and checks the UTC date once per hour while a session remains open, so multi-day sessions still decay without frequent polling or a restart. The default `initial=0.5`, `initialRate=0.28`, and `deletionThreshold=0.1` satisfy `0.5 × 0.72^5 ≈ 0.097`, so an unused new memory is soft-deleted after five days. Additional activity, sessions, or reloads on the same day do not decay it again.
+
+Useful feedback raises confidence and reduces `decayRate`, making repeatedly useful memories decay progressively more slowly; judged relevant recall resets the daily clock without adding confidence or changing decay rate. Unhelpful feedback only lowers confidence—it does not increase decay rate or renew the daily clock. Records below the configured deletion threshold are soft-deleted with `deletedAt` and `deletionCause: low_confidence`. Legacy records receive a fresh daily-decay clock on migration, preventing retroactive decay across their full historical age.
 
 ## Recent-memory suppression
 

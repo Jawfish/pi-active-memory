@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assistantExtractionPrompt, assistantValidationPrompt, extractionPrompt, mergePrompt, validationPrompt } from "../src/prompts.js";
+import { assistantExtractionPrompt, assistantValidationPrompt, compactionPrompt, compactionValidationPrompt, extractionPrompt, mergePrompt, validationPrompt } from "../src/prompts.js";
 
 test("extraction prompt makes the user message the only evidence source", () => {
   const prompt = extractionPrompt("I prefer it.", "assistant: it refers to early returns", "project");
@@ -41,6 +41,18 @@ test("assistant prompts require costly investigation rather than duration alone"
   assert.match(validation, /Duration alone is insufficient/);
   assert.match(validation, /simple-search/);
   assert.match(validation, /Reject all commands, project instructions/);
+});
+
+test("compaction prompts allow related claims while rejecting loss or invention", () => {
+  const memories = [{ id: "a", text: "Settings live in ~/.dotfiles." }, { id: "b", text: "The repository contains configs, not projects." }];
+  const proposal = compactionPrompt(memories);
+  assert.match(proposal, /Related, complementary claims about the same subject may be combined/);
+  assert.match(proposal, /every source claim must remain represented/);
+  assert.match(proposal, /one terse, self-contained sentence/);
+  const validation = compactionValidationPrompt(memories, "Personal configs, not projects, live in ~/.dotfiles.");
+  assert.match(validation, /collectively supported by the source memories/);
+  assert.match(validation, /preserves every source claim/);
+  assert.match(validation, /introduces no new claim/);
 });
 
 test("merge prompt requires pre-write resolution and protects user authority", () => {

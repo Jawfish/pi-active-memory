@@ -38,6 +38,10 @@ test("JSON store performs vector search and scope filtering", async () => {
     await store.upsert({ ...record("legacy", "global"), kind: "decision" } as unknown as MemoryRecord, [1, 0]);
     const found = await store.search([1, 0], { status: "active", scopes: ["global", "project"], kinds: ["user_profile", "fact", "skill_workflow"], projectId: "a" }, 10);
     assert.deepEqual(found.map((m) => m.record.id), ["global", "project-a"]);
+    assert.equal(await store.update({ ...record("global", "global"), confidence: 0.6 }), true);
+    const updated = await store.search([1, 0], { status: "active", scopes: ["global"], kinds: ["fact"] }, 10);
+    assert.equal(updated[0]?.record.confidence, 0.6);
+    assert.equal(updated[0]?.score, 1);
     assert.equal(await store.markDeleted("global"), true);
     assert.deepEqual((await store.list({ status: "active", kinds: ["user_profile", "fact", "skill_workflow"] }, 10)).map((m) => m.id).sort(), ["project-a", "project-b"]);
   } finally { await rm(dir, { recursive: true, force: true }); }

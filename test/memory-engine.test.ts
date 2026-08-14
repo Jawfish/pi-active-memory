@@ -8,7 +8,17 @@ class Store implements VectorStore {
   records: MemoryRecord[] = [];
   matches: MemoryMatch[] = [];
   async initialize(): Promise<void> {}
-  async upsert(record: MemoryRecord): Promise<void> { this.records.push(record); }
+  async upsert(record: MemoryRecord): Promise<void> {
+    const index = this.records.findIndex((candidate) => candidate.id === record.id);
+    if (index >= 0) this.records[index] = record;
+    else this.records.push(record);
+  }
+  async update(record: MemoryRecord): Promise<boolean> {
+    const index = this.records.findIndex((candidate) => candidate.id === record.id);
+    if (index < 0) return false;
+    this.records[index] = record;
+    return true;
+  }
   async search(_vector: number[], _filter: MemoryFilter, _limit: number): Promise<MemoryMatch[]> { return this.matches; }
   async list(): Promise<MemoryRecord[]> { return this.records; }
   async markDeleted(): Promise<boolean> { return false; }
@@ -49,6 +59,7 @@ test("capture accepts supported user evidence and records its provenance", async
   assert.equal(store.records[0]?.source.actor, "user");
   assert.equal(store.records[0]?.source.cause, "explicit_user_statement");
   assert.equal(store.records[0]?.priority, 1);
+  assert.equal(store.records[0]?.confidence, DEFAULT_CONFIG.memoryLifecycle.confidence.initial);
 });
 
 test("capture rejects legacy or unsupported memory categories", async () => {
@@ -82,7 +93,7 @@ test("assistant capture is time-gated and stores lower-priority provenance", asy
   assert.equal(record.source.cause, "Find parser registration");
   assert.match(record.source.reason ?? "", /generated imports/);
   assert.equal(record.source.elapsedMs, 61_000);
-  assert.equal(record.confidence, DEFAULT_CONFIG.assistantCapture.maximumConfidence);
+  assert.equal(record.confidence, DEFAULT_CONFIG.memoryLifecycle.confidence.initial);
   assert.equal(record.priority, DEFAULT_CONFIG.assistantCapture.priority);
 });
 
@@ -146,4 +157,97 @@ test("recall excludes recent current-session memory but keeps older and other-se
   ], store);
   const recalled = await subject.recall("current task");
   assert.deepEqual(recalled?.relevant.map((match) => match.record.id), ["old", "other"]);
+});
+
+test("lifecycle sweep migrates legacy records and soft-deletes expired records", async () => {
+  const store = new Store();
+  const legacy = memory("legacy", "old", "2020-01-01T00:00:00Z");
+  const expired = {
+    ...memory("expired", "old", "2020-01-01T00:00:00Z"),
+    decayRate: DEFAULT_CONFIG.memoryLifecycle.decay.initialRate,
+    lifecycle: {
+      lastDecayDate: "2025-12-01",
+      lastRelevantAt: "2025-12-01T00:00:00Z",
+      lastRelevantSessionId: "old",
+      reinforcementCount: 0,
+      lastReinforcementCause: "created" as const,
+    },
+  };
+  store.records = [legacy, expired];
+  const result = await engine([], store).sweepLifecycle(new Date("2026-01-01T00:00:00Z"));
+  assert.deepEqual(result, { initialized: 1, expired: 1 });
+  assert.equal(store.records.find((record) => record.id === "legacy")?.status, "active");
+  assert.equal(store.records.find((record) => record.id === "legacy")?.lifecycle?.lastDecayDate, "2026-01-01");
+  assert.equal(store.records.find((record) => record.id === "expired")?.status, "deleted");
+  assert.equal(store.records.find((record) => record.id === "expired")?.lifecycle?.deletionCause, "low_confidence");
+});
+
+test("feedback updates an active memory with auditable provenance", async () => {
+  const store = new Store();
+  const existing = { ...memory("rated", "old", "2020-01-01T00:00:00Z"), confidence: 0.5 };
+  store.records = [existing];
+  const subject = engine([], store);
+  const updated = await subject.recordFeedback("rated", "steer-token", "useful", "Avoided rediscovering the location");
+  assert.equal(updated?.confidence, 0.6);
+  assert.equal(updated?.feedback?.useful, 1);
+  assert.equal(updated?.feedback?.history[0]?.steerToken, "steer-token");
+  assert.equal(updated?.feedback?.history[0]?.sessionId, "session");
+});
+
+test("user-approved compaction preserves authority and provenance while superseding sources", async () => {
+  const store = new Store();
+  const first = { ...memory("first", "old-a", "2020-01-01T00:00:00Z"), confidence: 0.8, priority: 0.7 };
+  const second = {
+    ...memory("second", "old-b", "2021-01-01T00:00:00Z"),
+    confidence: 0.6,
+    priority: 1,
+    sourceHistory: [{ actor: "user" as const, sessionId: "old-c", cwd: "/cwd", cause: "older", reason: "history" }],
+    feedback: { useful: 2, unhelpful: 1, lastAt: "2025-01-01T00:00:00Z", history: [] },
+  };
+  store.records = [first, second];
+  const subject = engine({ accept: true, reason: "Entailed duplicate" }, store);
+  const compacted = await subject.applyCompaction(
+    { enabled: true, sourceIds: ["first", "second"], text: "Canonical durable fact.", reason: "Exact duplicates" },
+    { records: [first, second], minimumSimilarity: 0.95 },
+  );
+  assert.equal(compacted.source.actor, "user");
+  assert.equal(compacted.source.cause, "user_invoked_compaction");
+  assert.equal(compacted.confidence, 0.8);
+  assert.equal(compacted.decayRate, DEFAULT_CONFIG.memoryLifecycle.decay.initialRate);
+  assert.equal(compacted.priority, 1);
+  assert.equal(compacted.createdAt, "2020-01-01T00:00:00Z");
+  assert.deepEqual(compacted.feedback && { useful: compacted.feedback.useful, unhelpful: compacted.feedback.unhelpful }, { useful: 2, unhelpful: 1 });
+  assert.deepEqual(compacted.supersedes, ["first", "second"]);
+  assert.deepEqual(compacted.sourceHistory?.map((source) => source.sessionId), ["old-a", "old-c", "old-b"]);
+  assert.equal(store.records.find((record) => record.id === "first")?.status, "superseded");
+  assert.equal(store.records.find((record) => record.id === "second")?.status, "superseded");
+  assert.equal(store.records.find((record) => record.id === compacted.id)?.status, "active");
+});
+
+test("compaction refuses to cross user and assistant authority", async () => {
+  const store = new Store();
+  const user = memory("user", "old", "2020-01-01T00:00:00Z");
+  const assistant = { ...memory("assistant", "old", "2020-01-01T00:00:00Z"), source: { actor: "assistant" as const, sessionId: "old", cwd: "/cwd", cause: "test", reason: "fixture" } };
+  const subject = engine({ accept: true }, store);
+  await assert.rejects(
+    subject.applyCompaction(
+      { enabled: true, sourceIds: ["user", "assistant"], text: "Unsafe merge.", reason: "test" },
+      { records: [user, assistant], minimumSimilarity: 1 },
+    ),
+    /authority boundaries/,
+  );
+});
+
+test("recall removes frequency-limited memories before relevance judgment", async () => {
+  const store = new Store();
+  const repeated = memory("repeated", "older-session", "2020-01-01T00:00:00Z");
+  const available = memory("available", "older-session", "2020-01-01T00:00:00Z");
+  store.matches = [{ record: repeated, score: 0.95 }, { record: available, score: 0.9 }];
+  const subject = engine([
+    { query: "relevant facts" },
+    { relevantIds: ["repeated", "available"], instruction: "Use the available memory", reason: "Relevant" },
+  ], store);
+
+  const recalled = await subject.recall("current task", undefined, new Set(["repeated"]));
+  assert.deepEqual(recalled?.relevant.map((match) => match.record.id), ["available"]);
 });

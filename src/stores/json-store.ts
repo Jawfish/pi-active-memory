@@ -41,6 +41,19 @@ export class JsonVectorStore implements VectorStore {
     });
   }
 
+  async update(record: MemoryRecord): Promise<boolean> {
+    await this.initialize();
+    let found = false;
+    await this.serial(async () => {
+      const row = this.data.rows.find((candidate) => candidate.record.id === record.id);
+      if (!row) return;
+      row.record = normalizeProvenance(record);
+      found = true;
+      await this.persist();
+    });
+    return found;
+  }
+
   async search(vector: number[], filter: MemoryFilter, limit: number): Promise<MemoryMatch[]> {
     await this.initialize(vector.length);
     return this.data.rows

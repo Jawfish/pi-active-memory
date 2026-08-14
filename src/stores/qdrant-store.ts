@@ -26,6 +26,22 @@ export class QdrantVectorStore implements VectorStore {
     if (!response.ok) throw new Error(`Qdrant upsert failed: ${await response.text()}`);
   }
 
+  async update(record: MemoryRecord): Promise<boolean> {
+    const normalized = normalizeProvenance(record);
+    const lookup = await this.request(`/collections/${encodeURIComponent(this.collection)}/points`, {
+      method: "POST", body: JSON.stringify({ ids: [record.id], with_payload: false, with_vector: false }),
+    });
+    if (lookup.status === 404) return false;
+    if (!lookup.ok) throw new Error(`Qdrant lookup failed: ${await lookup.text()}`);
+    const found = await lookup.json() as { result?: unknown[] };
+    if (!found.result?.length) return false;
+    const response = await this.request(`/collections/${encodeURIComponent(this.collection)}/points/payload?wait=true`, {
+      method: "POST", body: JSON.stringify({ payload: normalized, points: [record.id] }),
+    });
+    if (!response.ok) throw new Error(`Qdrant payload update failed: ${await response.text()}`);
+    return true;
+  }
+
   async search(vector: number[], filter: MemoryFilter, limit: number): Promise<MemoryMatch[]> {
     await this.initialize(vector.length);
     const body = { vector, limit, with_payload: true, filter: toQdrantFilter(filter) };

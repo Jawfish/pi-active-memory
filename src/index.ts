@@ -1,19 +1,27 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { fuzzyFilter, Input, Text, truncateToWidth, type Focusable } from "@earendil-works/pi-tui";
+import { randomUUID } from "node:crypto";
+import { getSettingsListTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Container, fuzzyFilter, Input, SettingsList, Text, truncateToWidth, type Focusable, type SettingItem } from "@earendil-works/pi-tui";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { ActivityLogger } from "./activity-log.js";
-import { loadConfig, publicConfig } from "./config.js";
+import { DeferredSerialQueue } from "./background-queue.js";
+import type { CompactionProposal } from "./compaction.js";
+import { DAILY_SWEEP_POLL_INTERVAL_MS, DailySweepGate } from "./daily-sweep.js";
+import { reviewCompactionPair } from "./compaction-review.js";
+import { loadConfig, publicConfig, saveUserCompactionThreshold, saveUserMemoryLifecycle } from "./config.js";
 import { Embedder } from "./embeddings.js";
 import { PiFastModel } from "./fast-model.js";
+import { SteerFeedbackLedger } from "./feedback.js";
 import { MemoryEngine, rankMemoryMatches } from "./memory-engine.js";
 import { JsonVectorStore } from "./stores/json-store.js";
 import { QdrantVectorStore } from "./stores/qdrant-store.js";
+import { activeMemoryStatus, compactionProgressStatus } from "./status.js";
+import { MemorySteerLimiter } from "./steer-frequency.js";
 import type { ActiveMemoryConfig, MemoryKind, MemoryRecord, MemoryScope, VectorStore } from "./types.js";
 import { boundedAssistantInvestigation, boundedContext, redactSecrets, stableProjectId, textFromContent } from "./utils.js";
 
-interface SteerDetails { memoryIds: string[]; scores: number[]; reason: string; projectId: string; source: "active-memory" }
-interface Investigation { startedAt: number; cause: string; toolResults: number; startEntryCount: number }
+interface SteerDetails { memoryIds: string[]; scores: number[]; reason: string; projectId: string; feedbackToken: string; source: "active-memory" }
+interface Investigation { startedAt: number; cause: string; toolResults: number; startEntryCount?: number }
 const SUPPORTED_MEMORY_KINDS: MemoryKind[] = ["user_profile", "fact", "skill_workflow"];
 
 export default function activeMemoryExtension(pi: ExtensionAPI) {
@@ -25,25 +33,31 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   let engine: MemoryEngine | undefined;
   let projectId = "uninitialized";
   let paused = false;
-  let captureQueue = Promise.resolve();
+  const captureQueue = new DeferredSerialQueue();
+  let initialRecallPrompt: string | undefined;
+  let steerLimiter: MemorySteerLimiter | undefined;
+  let feedbackLedger = new SteerFeedbackLedger();
   let recallInFlight = false;
   let recallPending: { ctx: ExtensionContext; context: string; generation: number } | undefined;
-  let turns = 0, toolResults = 0, thinkingCharacters = 0;
+  let turns = 0, turnSequence = 0, toolResults = 0, thinkingCharacters = 0;
   let lastSteerAt = 0;
   let lastSteerFingerprint = "";
   let lastRecall: SteerDetails | undefined;
   let lastError: string | undefined;
   let capturedCount = 0;
   let investigation: Investigation | undefined;
+  const dailySweepGate = new DailySweepGate();
+  let dailySweepTimer: ReturnType<typeof setInterval> | undefined;
 
   const setStatus = (ctx: ExtensionContext) => {
     if (!ctx.hasUI) return;
-    const state = paused ? "paused" : lastError ? "error" : recallInFlight ? "recalling" : "ready";
-    ctx.ui.setStatus("active-memory", `memory:${state}`);
+    ctx.ui.setStatus("active-memory", `memory:${activeMemoryStatus(paused, lastError, recallInFlight)}`);
   };
 
   pi.registerMessageRenderer<SteerDetails>("active-memory-steer", (message, options, theme) => {
-    let text = `${theme.fg("accent", "🧠 Memory steer")}\n${message.content}`;
+    const rawContent = typeof message.content === "string" ? message.content : textFromContent(message.content, false);
+    const visibleContent = rawContent.split("\n\n[Memory feedback token:", 1)[0] ?? rawContent;
+    let text = `${theme.fg("accent", "🧠 Memory steer")}\n${visibleContent}`;
     if (options.expanded && message.details) {
       text += `\n${theme.fg("dim", `memories: ${message.details.memoryIds.join(", ")}`)}`;
       if (message.details.reason) text += `\n${theme.fg("dim", `reason: ${message.details.reason}`)}`;
@@ -53,8 +67,11 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     const thisGeneration = ++generation;
-    paused = false; turns = 0; toolResults = 0; thinkingCharacters = 0; lastError = undefined; investigation = undefined;
+    paused = false; turns = 0; turnSequence = 0; toolResults = 0; thinkingCharacters = 0; lastError = undefined; investigation = undefined; initialRecallPrompt = undefined;
     config = await loadConfig(ctx.cwd, ctx.isProjectTrusted());
+    dailySweepGate.reset();
+    steerLimiter = new MemorySteerLimiter(config.recall);
+    feedbackLedger = new SteerFeedbackLedger();
     if (!config.enabled) { paused = true; setStatus(ctx); return; }
     const remote = await pi.exec("git", ["config", "--get", "remote.origin.url"], { timeout: 3000 }).catch(() => undefined);
     projectId = stableProjectId(ctx.cwd, remote?.stdout);
@@ -78,18 +95,22 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     embedder = new Embedder(config.embedding, embeddingKey);
     const fast = new PiFastModel(config.fastModel, ctx);
     engine = new MemoryEngine(config, store, embedder, fast, projectId, ctx.sessionManager.getSessionId(), ctx.cwd, (type, data) => activity?.log(type, data));
+    const lifecycle = await engine.sweepLifecycle();
+    if (lifecycle.expired) activity.log("lifecycle.sweep", lifecycle);
+    dailySweepTimer = setInterval(() => queueDailySweep(ctx), DAILY_SWEEP_POLL_INTERVAL_MS);
+    dailySweepTimer.unref?.();
     setStatus(ctx);
   });
 
   pi.on("input", (event, ctx) => {
     if (event.source === "extension") return;
     const text = event.text.trim();
-    if (text && !investigation) investigation = { startedAt: Date.now(), cause: text.slice(0, 2000), toolResults: 0, startEntryCount: ctx.sessionManager.buildContextEntries().length };
+    if (text && !investigation) investigation = { startedAt: Date.now(), cause: text.slice(0, 2000), toolResults: 0 };
     if (paused || !engine || !config?.capture.enabled || !text) return;
-    const context = boundedContext(ctx.sessionManager.buildContextEntries(), config.capture.contextCharacters);
     const taskGeneration = generation;
-    captureQueue = captureQueue.then(async () => {
-      if (taskGeneration !== generation || paused || !engine) return;
+    captureQueue.enqueue(async () => {
+      if (taskGeneration !== generation || paused || !engine || !config) return;
+      const context = boundedContext(ctx.sessionManager.buildContextEntries(), config.capture.contextCharacters);
       try {
         capturedCount += await engine.capture(text, context);
         lastError = undefined;
@@ -101,25 +122,19 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     });
   });
 
-  pi.on("before_agent_start", async (event, ctx) => {
-    if (!investigation && event.prompt.trim()) investigation = { startedAt: Date.now(), cause: event.prompt.trim().slice(0, 2000), toolResults: 0, startEntryCount: ctx.sessionManager.buildContextEntries().length };
-    if (paused || !engine || !config?.recall.enabled) return;
-    const context = `${boundedContext(ctx.sessionManager.buildContextEntries(), config.recall.contextCharacters)}\n\nuser: ${event.prompt}`.slice(-config.recall.contextCharacters);
-    try {
-      const recalled = await engine.recall(context, ctx.signal);
-      if (!recalled) return;
-      const details = makeDetails(recalled, projectId);
-      if (isDuplicateSteer(details, recalled.instruction)) return;
-      rememberSteer(details, recalled.instruction);
-      lastRecall = details;
-      lastError = undefined;
-      activity?.log("steer.injected", { delivery: "before_agent_start", ...details, ...(config.activityLog.includeText ? { instruction: recalled.instruction } : {}) });
-      return { message: { customType: "active-memory-steer", content: recalled.instruction, display: true, details } };
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-      activity?.log("recall.error", { phase: "before_agent_start", error: lastError });
-      setStatus(ctx);
-    }
+  pi.on("before_agent_start", (event) => {
+    const prompt = event.prompt.trim();
+    if (!investigation && prompt) investigation = { startedAt: Date.now(), cause: prompt.slice(0, 2000), toolResults: 0 };
+    initialRecallPrompt = prompt || undefined;
+  });
+
+  pi.on("agent_start", (_event, ctx) => {
+    if (investigation?.startEntryCount === undefined) investigation!.startEntryCount = ctx.sessionManager.buildContextEntries().length;
+    const prompt = initialRecallPrompt;
+    initialRecallPrompt = undefined;
+    if (!prompt || paused || !engine || !config?.recall.enabled) return;
+    const context = `${boundedContext(ctx.sessionManager.buildContextEntries(), config.recall.contextCharacters)}\n\nuser: ${prompt}`.slice(-config.recall.contextCharacters);
+    queueRecall(ctx, context);
   });
 
   pi.on("message_update", (event, ctx) => {
@@ -146,10 +161,10 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     if (!completed || paused || !engine || !config?.assistantCapture.enabled) return;
     const elapsedMs = Date.now() - completed.startedAt;
     if (elapsedMs < config.assistantCapture.minimumElapsedMs) return;
-    const context = boundedAssistantInvestigation(ctx.sessionManager.buildContextEntries().slice(completed.startEntryCount), config.assistantCapture.contextCharacters);
+    const context = boundedAssistantInvestigation(ctx.sessionManager.buildContextEntries().slice(completed.startEntryCount ?? 0), config.assistantCapture.contextCharacters);
     if (!context.trim()) return;
     const taskGeneration = generation;
-    captureQueue = captureQueue.then(async () => {
+    captureQueue.enqueue(async () => {
       if (taskGeneration !== generation || paused || !engine) return;
       try {
         capturedCount += await engine.captureAssistantInvestigation(context, completed.cause, elapsedMs);
@@ -163,6 +178,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", (_event, ctx) => {
+    turnSequence++;
     if (!config || ++turns < config.recall.everyTurns) return;
     turns = 0;
     queueRecall(ctx, boundedContext(ctx.sessionManager.buildContextEntries(), config.recall.contextCharacters));
@@ -170,12 +186,38 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (event) => {
     generation++;
+    if (dailySweepTimer) clearInterval(dailySweepTimer);
+    dailySweepTimer = undefined;
     activity?.log("session.shutdown", { reason: event.reason });
-    await captureQueue.catch(() => {});
+    await captureQueue.drain().catch(() => {});
     await store?.close().catch(() => {});
     await activity?.flush();
-    store = undefined; activity = undefined; embedder = undefined; engine = undefined; recallPending = undefined; investigation = undefined;
+    store = undefined; activity = undefined; embedder = undefined; engine = undefined; steerLimiter = undefined; recallPending = undefined; investigation = undefined; initialRecallPrompt = undefined;
   });
+
+  function queueDailySweep(ctx: ExtensionContext, now = new Date()): void {
+    if (paused || !engine || !config?.memoryLifecycle.enabled) return;
+    const date = dailySweepGate.claim(now);
+    if (!date) return;
+    const taskGeneration = generation;
+    captureQueue.enqueue(async () => {
+      if (taskGeneration !== generation || paused || !engine) {
+        dailySweepGate.complete(date, false);
+        return;
+      }
+      try {
+        const result = await engine.sweepLifecycle(now);
+        dailySweepGate.complete(date, true);
+        activity?.log("lifecycle.daily_sweep", { utcDate: date, ...result });
+        lastError = undefined;
+      } catch (error) {
+        dailySweepGate.complete(date, false);
+        lastError = error instanceof Error ? error.message : String(error);
+        activity?.log("lifecycle.sweep_error", { utcDate: date, error: lastError });
+      }
+      setStatus(ctx);
+    });
+  }
 
   function queueRecall(ctx: ExtensionContext, context: string): void {
     if (paused || !engine || !config?.recall.enabled || !context.trim()) return;
@@ -199,14 +241,18 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
         if (Date.now() - lastSteerAt < config.recall.cooldownMs) continue;
         setStatus(job.ctx);
         try {
-          const recalled = await engine.recall(job.context, job.ctx.signal);
+          const suppressedIds = steerLimiter?.suppressedIds(Date.now(), turnSequence) ?? new Set<string>();
+          const recalled = await engine.recall(job.context, job.ctx.signal, suppressedIds);
           if (!recalled || job.generation !== generation) continue;
           const details = makeDetails(recalled, projectId);
           if (isDuplicateSteer(details, recalled.instruction)) continue;
           rememberSteer(details, recalled.instruction);
+          feedbackLedger.register(details.feedbackToken, details.memoryIds);
           lastRecall = details;
-          pi.sendMessage({ customType: "active-memory-steer", content: recalled.instruction, display: true, details }, { deliverAs: "steer", triggerTurn: false });
-          activity?.log("steer.queued", { delivery: "steer", ...details, ...(config.activityLog.includeText ? { instruction: recalled.instruction } : {}) });
+          const delivery = job.ctx.isIdle() ? "nextTurn" : "steer";
+          const feedbackHint = `\n\n[Memory feedback token: ${details.feedbackToken}. After a memory materially helps or hinders the work, call memory_feedback once for that memory.]`;
+          pi.sendMessage({ customType: "active-memory-steer", content: `${recalled.instruction}${feedbackHint}`, display: true, details }, { deliverAs: delivery, triggerTurn: false });
+          activity?.log("steer.queued", { delivery, ...details, ...(config.activityLog.includeText ? { instruction: recalled.instruction } : {}) });
           lastError = undefined;
         } catch (error) {
           lastError = error instanceof Error ? error.message : String(error);
@@ -214,17 +260,23 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
         }
       }
     } finally {
+      // Always leave the footer in a terminal state after recall, including errors.
       recallInFlight = false;
       if (statusCtx && statusGeneration === generation) setStatus(statusCtx);
     }
   }
 
   function makeDetails(recalled: Awaited<ReturnType<MemoryEngine["recall"]>> & {}, id: string): SteerDetails {
-    return { memoryIds: recalled.relevant.map((m) => m.record.id), scores: recalled.relevant.map((m) => m.score), reason: recalled.reason, projectId: id, source: "active-memory" };
+    return { memoryIds: recalled.relevant.map((m) => m.record.id), scores: recalled.relevant.map((m) => m.score), reason: recalled.reason, projectId: id, feedbackToken: randomUUID(), source: "active-memory" };
   }
   function fingerprint(details: SteerDetails, instruction: string): string { return `${details.memoryIds.sort().join(",")}|${instruction.toLowerCase()}`; }
   function isDuplicateSteer(details: SteerDetails, instruction: string): boolean { return fingerprint(details, instruction) === lastSteerFingerprint; }
-  function rememberSteer(details: SteerDetails, instruction: string): void { lastSteerFingerprint = fingerprint(details, instruction); lastSteerAt = Date.now(); }
+  function rememberSteer(details: SteerDetails, instruction: string): void {
+    const now = Date.now();
+    lastSteerFingerprint = fingerprint(details, instruction);
+    lastSteerAt = now;
+    steerLimiter?.record(details.memoryIds, now, turnSequence);
+  }
 
   async function visibleMemories(): Promise<MemoryRecord[]> {
     if (!store) return [];
@@ -390,6 +442,65 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       ctx.ui.notify(JSON.stringify({ state: paused ? "paused" : "active", projectId, memories: count, capturedThisSession: capturedCount, recallInFlight, activityLog: activity?.path, lastRecall, lastError, config: config && publicConfig(config) }, null, 2), lastError ? "warning" : "info");
     },
   });
+  pi.registerCommand("memory-settings", {
+    description: "Configure active-memory extension settings",
+    handler: async (_args, ctx) => {
+      if (!config) return ctx.ui.notify("Active-memory configuration is not initialized", "warning");
+      if (ctx.mode !== "tui") return ctx.ui.notify("Memory settings require TUI mode", "warning");
+      const values = ["0.3", "0.4", "0.5", "0.6", "0.7", "0.8", "0.9"];
+      const currentValue = config.compaction.similarityThreshold.toFixed(1);
+      if (!values.includes(currentValue)) values.push(currentValue);
+      values.sort((left, right) => Number(left) - Number(right));
+      const rateValues = ["0.00", "0.05", "0.10", "0.15", "0.20", "0.25", "0.28", "0.30", "0.40", "0.50"];
+      const thresholdValues = ["0.05", "0.10", "0.15", "0.20", "0.30"];
+      const items: SettingItem[] = [
+        {
+          id: "compaction.similarityThreshold",
+          label: "Compaction similarity threshold",
+          description: "Lower values offer more related memory pairs for manual review",
+          currentValue,
+          values,
+        },
+        {
+          id: "memoryLifecycle.decay.initialRate",
+          label: "New-memory daily decay rate",
+          description: "Daily fraction of confidence lost while unused",
+          currentValue: config.memoryLifecycle.decay.initialRate.toFixed(2),
+          values: rateValues,
+        },
+        {
+          id: "memoryLifecycle.confidence.deletionThreshold",
+          label: "Memory deletion confidence",
+          description: "Soft-delete after daily decay or feedback drops confidence below this value",
+          currentValue: config.memoryLifecycle.confidence.deletionThreshold.toFixed(2),
+          values: thresholdValues,
+        },
+      ];
+      await ctx.ui.custom((_tui, theme, _keybindings, done) => {
+        const container = new Container();
+        container.addChild(new Text(theme.fg("accent", theme.bold("Active-memory settings")), 1, 1));
+        const settings = new SettingsList(items, 7, getSettingsListTheme(), (id, value) => {
+          const number = Number(value);
+          if (id === "compaction.similarityThreshold") {
+            config!.compaction.similarityThreshold = number;
+            void saveUserCompactionThreshold(number).then(() => activity?.log("config.updated", { id, value: number, scope: "user" }))
+              .catch((error) => ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"));
+            return;
+          }
+          if (id === "memoryLifecycle.decay.initialRate") config!.memoryLifecycle.decay.initialRate = number;
+          if (id === "memoryLifecycle.confidence.deletionThreshold") config!.memoryLifecycle.confidence.deletionThreshold = number;
+          void saveUserMemoryLifecycle(config!.memoryLifecycle).then(() => activity?.log("config.updated", { id, value: number, scope: "user" }))
+            .catch((error) => ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"));
+        }, () => done(undefined));
+        container.addChild(settings);
+        return {
+          render: (width) => container.render(width),
+          invalidate: () => container.invalidate(),
+          handleInput: (data) => settings.handleInput?.(data),
+        };
+      });
+    },
+  });
   pi.registerCommand("memory-pause", { description: "Pause automatic capture and recall", handler: async (_args, ctx) => { paused = true; activity?.log("automation.paused"); setStatus(ctx); } });
   pi.registerCommand("memory-resume", { description: "Resume automatic capture and recall", handler: async (_args, ctx) => { paused = false; activity?.log("automation.resumed"); setStatus(ctx); } });
   pi.registerCommand("memory-why", { description: "Explain the latest memory steer", handler: async (_args, ctx) => ctx.ui.notify(lastRecall ? JSON.stringify(lastRecall, null, 2) : "No memory steer yet", "info") });
@@ -399,14 +510,14 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       if (!store) return ctx.ui.notify("Memory store is not initialized", "warning");
       const scope = args.trim() === "global" || args.trim() === "project" ? args.trim() as MemoryScope : undefined;
       const rows = await store.list({ status: "active", kinds: SUPPORTED_MEMORY_KINDS, ...(scope ? { scopes: [scope] } : {}), ...(scope === "project" ? { projectId } : {}) }, 100);
-      ctx.ui.notify(rows.length ? rows.map((m) => `${m.id} [${m.scope}/${m.kind}/${m.source.actor ?? "user"} confidence=${m.confidence.toFixed(2)}] ${m.text}\n  cause: ${m.source.cause ?? "legacy record"}; why: ${m.source.reason ?? "not recorded"}`).join("\n") : "No memories", "info");
+      ctx.ui.notify(rows.length ? rows.map((m) => `${m.id} [${m.scope}/${m.kind}/${m.source.actor ?? "user"} confidence=${m.confidence.toFixed(2)} decay=${(m.decayRate ?? config?.memoryLifecycle.decay.initialRate ?? 0).toFixed(2)} lastDecay=${m.lifecycle?.lastDecayDate ?? "unmigrated"}] ${m.text}\n  cause: ${m.source.cause ?? "legacy record"}; why: ${m.source.reason ?? "not recorded"}; feedback: +${m.feedback?.useful ?? 0}/-${m.feedback?.unhelpful ?? 0}`).join("\n") : "No memories", "info");
     },
   });
   pi.registerCommand("memory", {
     description: "Fuzzy-find a memory, then edit or delete it",
     handler: async (_args, ctx) => {
       if (!store) return ctx.ui.notify("Memory store is not initialized", "warning");
-      await captureQueue.catch(() => {});
+      await captureQueue.drain().catch(() => {});
       const record = await pickMemory(ctx);
       if (!record) return;
       const action = await ctx.ui.select("Memory action", ["Edit text and metadata", "Delete", "Cancel"]);
@@ -418,7 +529,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     description: "Fuzzy-find and edit a memory, including its metadata",
     handler: async (_args, ctx) => {
       if (!store) return ctx.ui.notify("Memory store is not initialized", "warning");
-      await captureQueue.catch(() => {});
+      await captureQueue.drain().catch(() => {});
       const record = await pickMemory(ctx);
       if (record) await editMemory(ctx, record);
     },
@@ -427,7 +538,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     description: "Fuzzy-find and soft-delete a memory; an exact ID or unique prefix is optional",
     handler: async (args, ctx) => {
       if (!store) return ctx.ui.notify("Memory store is not initialized", "warning");
-      await captureQueue.catch(() => {});
+      await captureQueue.drain().catch(() => {});
       const input = args.trim();
       const record = input ? await findByIdOrPrefix(input) : await pickMemory(ctx);
       if (!record) {
@@ -435,6 +546,62 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
         return;
       }
       await deleteMemory(ctx, record);
+    },
+  });
+  pi.registerCommand("memory-compact", {
+    description: "Review related memory pairs and combine selected pairs; never runs automatically",
+    handler: async (_args, ctx) => {
+      if (!engine || !config) return ctx.ui.notify("Memory engine is not initialized", "warning");
+      if (ctx.mode !== "tui") return ctx.ui.notify("Memory compaction requires TUI review", "warning");
+      let terminalState: "completed" | "cancelled" | "error" = "completed";
+      let applied = 0;
+      try {
+        ctx.ui.setStatus("active-memory-compaction", compactionProgressStatus("processing"));
+        ctx.ui.setWorkingMessage("Finding and comparing related memories…");
+        await captureQueue.drain();
+        const plan = await engine.planCompaction(ctx.signal);
+        ctx.ui.setWorkingMessage();
+        if (!plan.clusters.length) {
+          ctx.ui.notify("No related memory pairs found", "info");
+          return;
+        }
+        for (let index = 0; index < plan.clusters.length; index++) {
+          const cluster = plan.clusters[index]!;
+          const [first, second] = cluster.records;
+          const suggested = plan.proposals[index];
+          if (!first || !second || !suggested?.enabled) continue;
+          ctx.ui.setStatus("active-memory-compaction", compactionProgressStatus("reviewing", index + 1, plan.clusters.length));
+          const reviewed = await reviewCompactionPair(ctx, first.text, second.text, suggested.text, {
+            current: index + 1,
+            total: plan.clusters.length,
+          });
+          if (reviewed.action === "cancel") {
+            terminalState = "cancelled";
+            break;
+          }
+          if (reviewed.action === "skip") continue;
+          ctx.ui.setStatus("active-memory-compaction", compactionProgressStatus("applying", index + 1, plan.clusters.length));
+          ctx.ui.setWorkingMessage("Validating and saving combined memory…");
+          const proposal: CompactionProposal = { ...suggested, text: reviewed.text.trim() };
+          await engine.applyCompaction(proposal, cluster, ctx.signal);
+          ctx.ui.setWorkingMessage();
+          applied++;
+        }
+        const message = terminalState === "cancelled"
+          ? `Memory compaction cancelled after combining ${applied} pair${applied === 1 ? "" : "s"}`
+          : applied
+            ? `Memory compaction finished: combined ${applied} pair${applied === 1 ? "" : "s"}`
+            : "Memory compaction finished: no memories combined";
+        ctx.ui.notify(message, "info");
+      } catch (error) {
+        terminalState = "error";
+        const message = error instanceof Error ? error.message : String(error);
+        activity?.log("compaction.error", { error: message });
+        ctx.ui.notify(`Memory compaction failed: ${message}`, "error");
+      } finally {
+        ctx.ui.setWorkingMessage();
+        ctx.ui.setStatus("active-memory-compaction", compactionProgressStatus(terminalState));
+      }
     },
   });
 
@@ -455,7 +622,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       if (!engine || !config) throw new Error("Memory engine is not initialized");
       if (!investigation) throw new Error("No active investigation is being timed");
       const elapsedMs = Date.now() - investigation.startedAt;
-      const context = boundedAssistantInvestigation(ctx.sessionManager.buildContextEntries().slice(investigation.startEntryCount), config.assistantCapture.contextCharacters);
+      const context = boundedAssistantInvestigation(ctx.sessionManager.buildContextEntries().slice(investigation.startEntryCount ?? 0), config.assistantCapture.contextCharacters);
       const stored = await engine.rememberAssistantResult(params, context, investigation.cause, elapsedMs, signal);
       return {
         content: [{ type: "text", text: stored ? "Stored or updated the assistant-sourced memory" : "Candidate was rejected as trivial, unsupported, duplicate, or lower-authority than an existing user memory" }],
@@ -473,12 +640,47 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     parameters: Type.Object({ query: Type.String(), scope: Type.Optional(StringEnum(["global", "project", "both"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })) }),
     async execute(_id, params, signal) {
       if (!store || !config || !embedder) throw new Error("Memory store is not initialized");
+      const currentConfig = config;
       const [vector] = await embedder.embed([params.query], signal);
       if (!vector) throw new Error("Embedding failed");
       const scopes = params.scope === "global" ? ["global" as const] : params.scope === "project" ? ["project" as const] : ["global" as const, "project" as const];
       const limit = params.limit ?? 8;
       const rows = rankMemoryMatches(await store.search(vector, { status: "active", scopes, kinds: SUPPORTED_MEMORY_KINDS, projectId }, Math.min(100, limit * 5))).slice(0, limit);
-      return { content: [{ type: "text", text: rows.length ? rows.map((m) => `${m.record.id} rank=${m.score.toFixed(3)} [${m.record.scope}/${m.record.kind}/${m.record.source.actor ?? "user"} confidence=${m.record.confidence.toFixed(2)}] ${m.record.text}\norigin: session=${m.record.source.sessionId}; cause=${m.record.source.cause ?? "legacy"}; why=${m.record.source.reason ?? "not recorded"}`).join("\n") : "No matching memories" }], details: { rows } };
+      return { content: [{ type: "text", text: rows.length ? rows.map((m) => `${m.record.id} rank=${m.score.toFixed(3)} [${m.record.scope}/${m.record.kind}/${m.record.source.actor ?? "user"} confidence=${m.record.confidence.toFixed(2)} decay=${(m.record.decayRate ?? currentConfig.memoryLifecycle.decay.initialRate).toFixed(2)}] ${m.record.text}\norigin: session=${m.record.source.sessionId}; cause=${m.record.source.cause ?? "legacy"}; why=${m.record.source.reason ?? "not recorded"}; lastDecay=${m.record.lifecycle?.lastDecayDate ?? "unmigrated"}`).join("\n") : "No matching memories" }], details: { rows } };
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_feedback", label: "Rate Steered Memory", description: "Report whether one memory from a specific active-memory steer materially helped or hindered the work. Feedback is bounded and adjusts future ranking confidence.",
+    promptSnippet: "Rate a steered memory after its usefulness becomes clear",
+    promptGuidelines: [
+      "Use memory_feedback only after a specific steered memory materially helped or hindered the work; do not rate mere retrieval, repeat feedback, or infer usefulness before an outcome is known.",
+    ],
+    parameters: Type.Object({
+      steerToken: Type.String({ description: "Feedback token included in the memory steer" }),
+      memoryId: Type.String({ description: "Exact memory ID from that steer" }),
+      outcome: StringEnum(["useful", "unhelpful"] as const),
+      reason: Type.String({ description: "Brief concrete effect on the work" }),
+    }),
+    async execute(_id, params) {
+      if (!engine || !config) throw new Error("Memory engine is not initialized");
+      if (!params.reason.trim()) throw new Error("Feedback requires a concrete reason");
+      const accepted = feedbackLedger.consume(params.steerToken, params.memoryId, config.memoryLifecycle.feedback.maxPerMemoryPerSession);
+      if (accepted !== "accepted") {
+        return { content: [{ type: "text", text: `Feedback rejected: ${accepted}` }], details: { accepted: false, reason: accepted, memoryId: params.memoryId, outcome: params.outcome, confidence: 0, status: "unchanged" } };
+      }
+      try {
+        const updated = await engine.recordFeedback(params.memoryId, params.steerToken, params.outcome, params.reason);
+        if (!updated) {
+          feedbackLedger.release(params.steerToken, params.memoryId);
+          return { content: [{ type: "text", text: `Memory ${params.memoryId} is no longer active` }], details: { accepted: false, reason: "inactive", memoryId: params.memoryId, outcome: params.outcome, confidence: 0, status: "inactive" } };
+        }
+        const lifecycleResult = updated.status === "deleted" ? ` and the memory was soft-deleted (${updated.lifecycle?.deletionCause ?? "expired"})` : "";
+        return { content: [{ type: "text", text: `Recorded ${params.outcome} feedback for ${params.memoryId}; confidence is now ${updated.confidence.toFixed(2)}${lifecycleResult}` }], details: { accepted: true, reason: params.reason, memoryId: updated.id, outcome: params.outcome, confidence: updated.confidence, status: updated.status } };
+      } catch (error) {
+        feedbackLedger.release(params.steerToken, params.memoryId);
+        throw error;
+      }
     },
   });
 

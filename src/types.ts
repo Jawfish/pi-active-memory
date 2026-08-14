@@ -14,6 +14,32 @@ export interface MemorySource {
   evidence?: string;
 }
 
+export interface MemoryFeedback {
+  outcome: "useful" | "unhelpful";
+  sessionId: string;
+  steerToken: string;
+  reason: string;
+  at: string;
+}
+
+export interface MemoryFeedbackSummary {
+  useful: number;
+  unhelpful: number;
+  lastAt: string;
+  history: MemoryFeedback[];
+}
+
+export interface MemoryLifecycle {
+  /** UTC calendar date through which multiplicative decay has been applied. */
+  lastDecayDate: string;
+  lastRelevantAt: string;
+  lastRelevantSessionId: string;
+  reinforcementCount: number;
+  lastReinforcementCause: "created" | "relevant_recall" | "useful_feedback" | "user_compaction" | "legacy_migration_grace";
+  deletedAt?: string;
+  deletionCause?: "low_confidence";
+}
+
 export interface MemoryRecord {
   id: string;
   text: string;
@@ -21,12 +47,16 @@ export interface MemoryRecord {
   scope: MemoryScope;
   projectId?: string;
   confidence: number;
+  /** Daily fraction lost: confidence *= (1 - decayRate) ^ elapsedDays. */
+  decayRate?: number;
   /** Ranking weight. Legacy records default to 1. */
   priority?: number;
   status: "active" | "superseded" | "deleted";
   supersedes?: string[];
   source: MemorySource;
   sourceHistory?: MemorySource[];
+  feedback?: MemoryFeedbackSummary;
+  lifecycle?: MemoryLifecycle;
   createdAt: string;
   updatedAt: string;
   embeddingModel: string;
@@ -39,6 +69,7 @@ export interface MemoryFilter { scopes?: MemoryScope[]; kinds?: MemoryKind[]; pr
 export interface VectorStore {
   initialize(dimension?: number): Promise<void>;
   upsert(record: MemoryRecord, vector: number[]): Promise<void>;
+  update(record: MemoryRecord): Promise<boolean>;
   search(vector: number[], filter: MemoryFilter, limit: number): Promise<MemoryMatch[]>;
   list(filter: MemoryFilter, limit: number): Promise<MemoryRecord[]>;
   markDeleted(id: string): Promise<boolean>;
@@ -58,6 +89,28 @@ export interface FastModelConfig {
   candidates: string[];
   thinking: "off" | "minimal" | "low" | "medium" | "high";
   maxTokens: number;
+}
+
+export interface MemoryLifecycleConfig {
+  enabled: boolean;
+  confidence: {
+    initial: number;
+    deletionThreshold: number;
+    minimum: number;
+    maximum: number;
+    usefulDelta: number;
+    unhelpfulDelta: number;
+  };
+  decay: {
+    initialRate: number;
+    minimumRate: number;
+    maximumRate: number;
+    usefulDelta: number;
+  };
+  feedback: {
+    maxPerMemoryPerSession: number;
+    historyLimit: number;
+  };
 }
 
 export interface ActiveMemoryConfig {
@@ -83,6 +136,11 @@ export interface ActiveMemoryConfig {
     priority: number;
     similarityThreshold: number;
   };
+  memoryLifecycle: MemoryLifecycleConfig;
+  compaction: {
+    similarityThreshold: number;
+    maximumProposals: number;
+  };
   recall: {
     enabled: boolean;
     topK: number;
@@ -91,6 +149,9 @@ export interface ActiveMemoryConfig {
     everyToolResults: number;
     thinkingCharacters: number;
     cooldownMs: number;
+    perMemoryCooldownMs: number;
+    perMemoryTurnCooldown: number;
+    maxSteersPerMemoryPerSession: number;
     minVectorScore: number;
     minimumMemoryAgeMinutes: number;
   };

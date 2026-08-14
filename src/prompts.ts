@@ -66,6 +66,23 @@ CANDIDATE:
 ${JSON.stringify(candidate)}`;
 }
 
+export function compactionPrompt(memories: Array<{ id: string; text: string }>): string {
+  return `Decide whether these semantically related memories can be replaced by one retrieval-effective memory without losing, broadening, contradicting, or inventing claims. They already share scope, kind, authority, and a bounded pairwise vector-similarity floor. Related, complementary claims about the same subject may be combined, but every source claim must remain represented and every merged clause must be traceable to at least one source. Reject diverse subjects, incompatible conditions, contradictions, or unrelated workflow steps. Keep merged text to one terse, self-contained sentence no longer than the longest source by more than 25%. Return {"merge":true,"text":"...","reason":"brief reason"} or {"merge":false,"text":"","reason":"brief reason"}.
+
+MEMORIES:
+${memories.map((memory) => `${memory.id}: ${memory.text}`).join("\n")}`;
+}
+
+export function compactionValidationPrompt(memories: Array<{ id: string; text: string }>, proposed: string): string {
+  return `Validate a user-reviewed memory consolidation. Accept only if PROPOSED is one terse sentence collectively supported by the source memories, preserves every source claim and its conditions, has every factual clause traceable to at least one source, introduces no new claim, and remains retrieval-effective. Reject omitted claims, broadened claims, contradictions, diverse subjects, or unrelated workflow steps. Return {"accept":true,"reason":"brief reason"} or {"accept":false,"reason":"brief reason"}.
+
+SOURCES:
+${memories.map((memory) => `${memory.id}: ${memory.text}`).join("\n")}
+
+PROPOSED:
+${proposed}`;
+}
+
 export function queryPrompt(context: string): string {
   return `Write one short semantic query for durable memories that could change the current work: user preferences, environment/project/tool facts, taught workflows, or hard-won findings. Do not answer the task. Return {"query":"..."}; use an empty query if no meaningful task.
 
