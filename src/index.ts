@@ -15,11 +15,12 @@ import { ActiveMemoryFooterStatus } from "./footer-status.js";
 import { MemoryEngine, rankMemoryMatches } from "./memory-engine.js";
 import { renderPrompt } from "./prompts.js";
 import { activeMemoryStatus, compactionProgressStatus } from "./status.js";
+import { formatSteerSentence, orderedFeedbackOutcomes, type SteerFeedbackOutcome } from "./steer-display.js";
 import { MemorySteerLimiter } from "./steer-frequency.js";
 import type { ActiveMemoryConfig, EmbeddingProvider, FastModelRunner, MemoryKind, MemoryRecord, MemoryScope, VectorStore } from "./types.js";
 import { boundedAssistantInvestigation, boundedContext, contextText, redactSecrets, stableProjectId, textFromContent } from "./utils.js";
 
-interface SteerDetails { memoryIds: string[]; scores: number[]; reason: string; projectId: string; feedbackToken: string; source: "active-memory" }
+interface SteerDetails { memoryIds: string[]; scores: number[]; reason: string; instruction?: string; projectId: string; feedbackToken: string; source: "active-memory" }
 interface Investigation { startedAt: number; cause: string; toolResults: number; startEntryCount?: number }
 const SUPPORTED_MEMORY_KINDS: MemoryKind[] = ["user_profile", "fact", "skill_workflow"];
 
@@ -36,6 +37,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   let initialRecallPrompt: string | undefined;
   let steerLimiter: MemorySteerLimiter | undefined;
   let feedbackLedger = new SteerFeedbackLedger();
+  const feedbackBySteer = new Map<string, Map<string, SteerFeedbackOutcome>>();
   let recallInFlight = false;
   let recallPending: { ctx: ExtensionContext; context: string; activeContext: string; generation: number } | undefined;
   let turns = 0, turnSequence = 0, toolResults = 0, thinkingCharacters = 0;
@@ -62,11 +64,17 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
 
   pi.registerMessageRenderer<SteerDetails>("active-memory-steer", (message, options, theme) => {
     const rawContent = typeof message.content === "string" ? message.content : textFromContent(message.content, false);
-    const visibleContent = rawContent.split("\n\n[Memory feedback token:", 1)[0] ?? rawContent;
-    let text = `${theme.fg("accent", "🧠 Memory steer")}\n${visibleContent}`;
-    if (options.expanded && message.details) {
-      text += `\n${theme.fg("dim", `memories: ${message.details.memoryIds.join(", ")}`)}`;
-      if (message.details.reason) text += `\n${theme.fg("dim", `reason: ${message.details.reason}`)}`;
+    const fallbackContent = rawContent.split(/\n\n\[Memory feedback token:/, 1)[0] ?? rawContent;
+    const details = message.details;
+    const steer = formatSteerSentence(details?.instruction ?? fallbackContent);
+    const outcomes = details ? orderedFeedbackOutcomes(details.memoryIds, feedbackBySteer.get(details.feedbackToken)) : [];
+    const indicators = outcomes.map((outcome) => outcome === "useful"
+      ? theme.fg("success", "🟢")
+      : theme.fg("error", "🔴"));
+    let text = `${theme.fg("accent", "🧠 Memory steer:")} ${steer}${indicators.length ? ` ${indicators.join(" ")}` : ""}`;
+    if (options.expanded && details) {
+      text += `\n${theme.fg("dim", `memories: ${details.memoryIds.join(", ")}`)}`;
+      if (details.reason) text += `\n${theme.fg("dim", `reason: ${details.reason}`)}`;
     }
     return new Text(text, 0, 0);
   });
@@ -79,6 +87,13 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     dailySweepGate.reset();
     steerLimiter = new MemorySteerLimiter(config.recall);
     feedbackLedger = new SteerFeedbackLedger();
+    feedbackBySteer.clear();
+    for (const entry of ctx.sessionManager.getBranch()) {
+      const message = entry.type === "message" ? entry.message : undefined;
+      if (message?.role !== "toolResult" || message.toolName !== "memory_feedback") continue;
+      const details = message.details as { accepted?: boolean; steerToken?: string; memoryId?: string; outcome?: SteerFeedbackOutcome } | undefined;
+      if (details?.accepted && details.steerToken && details.memoryId && details.outcome) recordDisplayedFeedback(details.steerToken, details.memoryId, details.outcome);
+    }
     if (!config.enabled) { paused = true; setStatus(ctx); return; }
     const remote = await pi.exec("git", ["config", "--get", "remote.origin.url"], { timeout: 3000 }).catch(() => undefined);
     projectId = stableProjectId(ctx.cwd, remote?.stdout);
@@ -282,7 +297,12 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   }
 
   function makeDetails(recalled: Awaited<ReturnType<MemoryEngine["recall"]>> & {}, id: string): SteerDetails {
-    return { memoryIds: recalled.relevant.map((m) => m.record.id), scores: recalled.relevant.map((m) => m.score), reason: recalled.reason, projectId: id, feedbackToken: randomUUID(), source: "active-memory" };
+    return { memoryIds: recalled.relevant.map((m) => m.record.id), scores: recalled.relevant.map((m) => m.score), reason: recalled.reason, instruction: recalled.instruction, projectId: id, feedbackToken: randomUUID(), source: "active-memory" };
+  }
+  function recordDisplayedFeedback(steerToken: string, memoryId: string, outcome: SteerFeedbackOutcome): void {
+    const outcomes = feedbackBySteer.get(steerToken) ?? new Map<string, SteerFeedbackOutcome>();
+    outcomes.set(memoryId, outcome);
+    feedbackBySteer.set(steerToken, outcomes);
   }
   function fingerprint(details: SteerDetails, instruction: string): string { return `${details.memoryIds.sort().join(",")}|${instruction.toLowerCase()}`; }
   function isDuplicateSteer(details: SteerDetails, instruction: string): boolean { return fingerprint(details, instruction) === lastSteerFingerprint; }
@@ -676,16 +696,17 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       if (!params.reason.trim()) throw new Error("Feedback requires a concrete reason");
       const accepted = feedbackLedger.consume(params.steerToken, params.memoryId, config.memoryLifecycle.feedback.maxPerMemoryPerSession);
       if (accepted !== "accepted") {
-        return { content: [{ type: "text", text: `Feedback rejected: ${accepted}` }], details: { accepted: false, reason: accepted, memoryId: params.memoryId, outcome: params.outcome, confidence: 0, status: "unchanged" } };
+        return { content: [{ type: "text", text: `Feedback rejected: ${accepted}` }], details: { accepted: false, reason: accepted, steerToken: params.steerToken, memoryId: params.memoryId, outcome: params.outcome, confidence: 0, status: "unchanged" } };
       }
       try {
         const updated = await engine.recordFeedback(params.memoryId, params.steerToken, params.outcome, params.reason);
         if (!updated) {
           feedbackLedger.release(params.steerToken, params.memoryId);
-          return { content: [{ type: "text", text: `Memory ${params.memoryId} is no longer active` }], details: { accepted: false, reason: "inactive", memoryId: params.memoryId, outcome: params.outcome, confidence: 0, status: "inactive" } };
+          return { content: [{ type: "text", text: `Memory ${params.memoryId} is no longer active` }], details: { accepted: false, reason: "inactive", steerToken: params.steerToken, memoryId: params.memoryId, outcome: params.outcome, confidence: 0, status: "inactive" } };
         }
+        recordDisplayedFeedback(params.steerToken, updated.id, params.outcome);
         const lifecycleResult = updated.status === "deleted" ? ` and the memory was soft-deleted (${updated.lifecycle?.deletionCause ?? "expired"})` : "";
-        return { content: [{ type: "text", text: `Recorded ${params.outcome} feedback for ${params.memoryId}; confidence is now ${updated.confidence.toFixed(2)}${lifecycleResult}` }], details: { accepted: true, reason: params.reason, memoryId: updated.id, outcome: params.outcome, confidence: updated.confidence, status: updated.status } };
+        return { content: [{ type: "text", text: `Recorded ${params.outcome} feedback for ${params.memoryId}; confidence is now ${updated.confidence.toFixed(2)}${lifecycleResult}` }], details: { accepted: true, reason: params.reason, steerToken: params.steerToken, memoryId: updated.id, outcome: params.outcome, confidence: updated.confidence, status: updated.status } };
       } catch (error) {
         feedbackLedger.release(params.steerToken, params.memoryId);
         throw error;

@@ -352,7 +352,7 @@ Stores a hard-won assistant result only during an active investigation that has 
 
 ### `memory_feedback`
 
-Rates one exact memory from one exact steer as `useful` or `unhelpful`, with a concrete reason. The tool requires the unguessable token included in that steer, accepts each token/memory pair once, and caps feedback per memory per session. Useful feedback raises confidence and renews lifecycle budgets; unhelpful feedback lowers confidence without renewing it. Full feedback provenance is retained in bounded history.
+Rates one exact memory from one exact steer as `useful` or `unhelpful`, with a concrete reason. The tool requires the unguessable token included in that steer, accepts each token/memory pair once, and caps feedback per memory per session. Useful feedback raises confidence and renews lifecycle budgets; unhelpful feedback lowers confidence without renewing it. Full feedback provenance is retained in bounded history. The one-line steer display adds a green `🟢` for useful feedback or red `🔴` for unhelpful feedback beside the steer.
 
 ### `memory_forget`
 
