@@ -127,6 +127,41 @@ test("assistant candidate searches first and updates an assistant memory", async
   assert.equal(store.records[0]?.source.cause, "Locate parser registry");
 });
 
+test("assistant memory correction replaces text and preserves provenance", async () => {
+  const store = new Store();
+  const existing = {
+    ...memory("assistant-memory", "older-session", "2020-01-01T00:00:00Z"),
+    text: "The parser registry is in src/old-registry.ts.",
+    confidence: 0.9,
+    priority: 0.8,
+    source: { actor: "assistant" as const, sessionId: "older-session", cwd: "/old", cause: "old investigation", reason: "old trace" },
+  };
+  store.records = [existing];
+  const corrected = await engine({}, store).correctAssistantMemory(
+    existing.id,
+    "The parser registry is in src/parser-registry.ts.",
+    "Repository inspection showed the old path no longer exists.",
+  );
+  assert.equal(corrected.id, existing.id);
+  assert.equal(corrected.text, "The parser registry is in src/parser-registry.ts.");
+  assert.equal(corrected.source.actor, "assistant");
+  assert.equal(corrected.source.cause, "correction_of_inaccurate_assistant_memory");
+  assert.equal(corrected.sourceHistory?.at(-1)?.cause, "old investigation");
+  assert.equal(corrected.confidence, DEFAULT_CONFIG.assistantCapture.maximumConfidence);
+  assert.equal(corrected.priority, DEFAULT_CONFIG.assistantCapture.priority);
+  assert.equal(store.records[0]?.text, corrected.text);
+});
+
+test("assistant memory correction cannot alter user-sourced memory", async () => {
+  const store = new Store();
+  store.records = [memory("user-memory", "older-session", "2020-01-01T00:00:00Z")];
+  await assert.rejects(
+    engine({}, store).correctAssistantMemory("user-memory", "Replacement text.", "The old claim is wrong."),
+    /Only assistant-generated memories can be corrected/,
+  );
+  assert.equal(store.records[0]?.text, "user-memory");
+});
+
 test("assistant candidate cannot overwrite a user-sourced memory", async () => {
   const store = new Store();
   const existing = memory("user-memory", "older-session", "2020-01-01T00:00:00Z");

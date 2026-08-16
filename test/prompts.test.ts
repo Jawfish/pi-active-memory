@@ -81,6 +81,13 @@ test("judge prompt rejects topical memories that add no new information", () => 
   assert.match(prompt, /return empty IDs even when a memory is topically relevant/);
 });
 
+test("assistant memory correction guidance protects user authority", () => {
+  const guidance = DEFAULT_PROMPTS.tools.memoryCorrect.guidelines.join("\n");
+  assert.match(guidance, /independently establish/);
+  assert.match(guidance, /assistant-generated memory is incorrect/);
+  assert.match(guidance, /never use it for user-sourced memories/);
+});
+
 test("merge prompt requires pre-write resolution and protects user authority", () => {
   const prompt = mergePrompt("candidate", "existing", "assistant");
   assert.match(prompt, /searched before this write/);

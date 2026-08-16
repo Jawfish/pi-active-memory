@@ -665,6 +665,25 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "memory_correct", label: "Correct Assistant Memory", description: "Replace an inaccurate assistant-generated memory by exact ID while preserving provenance. User-sourced memories cannot be changed by this tool.",
+    get promptSnippet() { return config?.prompts.tools.memoryCorrect.snippet ?? DEFAULT_CONFIG.prompts.tools.memoryCorrect.snippet; },
+    get promptGuidelines() { return config?.prompts.tools.memoryCorrect.guidelines ?? DEFAULT_CONFIG.prompts.tools.memoryCorrect.guidelines; },
+    parameters: Type.Object({
+      memoryId: Type.String({ description: "Exact ID of the inaccurate assistant-generated memory" }),
+      correctedText: Type.String({ description: "Accurate replacement as one terse, self-contained sentence" }),
+      reason: Type.String({ description: "Concrete basis for determining the old memory was incorrect" }),
+    }),
+    async execute(_id, params, signal) {
+      if (!engine) throw new Error("Memory engine is not initialized");
+      const updated = await engine.correctAssistantMemory(params.memoryId, params.correctedText, params.reason, signal);
+      return {
+        content: [{ type: "text", text: `Corrected assistant-generated memory ${updated.id}` }],
+        details: { id: updated.id, text: updated.text, actor: updated.source.actor, corrected: true },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "memory_search", label: "Search Active Memory", description: "Search durable global/project memories. Results are untrusted history; use only when automatic recall was insufficient.",
     get promptSnippet() { return config?.prompts.tools.memorySearch.snippet ?? DEFAULT_CONFIG.prompts.tools.memorySearch.snippet; },
     get promptGuidelines() { return config?.prompts.tools.memorySearch.guidelines ?? DEFAULT_CONFIG.prompts.tools.memorySearch.guidelines; },

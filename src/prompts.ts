@@ -83,6 +83,12 @@ MEMORIES:
         "Use memory_store_result only for terse, reusable findings that required at least 60 seconds of substantial investigation; reject routine facts, simple searches, task state, plans, guesses, and user-supplied information.",
       ],
     },
+    memoryCorrect: {
+      snippet: "Correct an inaccurate assistant-generated memory by exact ID",
+      guidelines: [
+        "If you independently establish that an assistant-generated memory is incorrect, use memory_correct to replace it with the accurate fact; never use it for user-sourced memories or merely stale, irrelevant, or redundant memories.",
+      ],
+    },
     memorySearch: {
       snippet: "Search memory on demand when automatic recall is insufficient",
       guidelines: [

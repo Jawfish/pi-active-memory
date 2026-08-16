@@ -138,6 +138,42 @@ export class MemoryEngine {
     return this.resolveAndStore(candidate, source, this.config.assistantCapture.similarityThreshold, validate, signal);
   }
 
+  async correctAssistantMemory(memoryId: string, correctedText: string, reason: string, signal?: AbortSignal): Promise<MemoryRecord> {
+    const records = await this.store.list({ scopes: ["global", "project"], kinds: ["user_profile", "fact", "skill_workflow"], projectId: this.projectId }, 10000);
+    const record = records.find((candidate) => candidate.id === memoryId && candidate.status === "active");
+    if (!record) throw new Error(`Active memory ${memoryId} was not found`);
+    if (record.source.actor !== "assistant") throw new Error("Only assistant-generated memories can be corrected by the model");
+    if (!reason.trim()) throw new Error("A concrete correction reason is required");
+    let text = correctedText.trim().slice(0, this.config.security.maxMemoryCharacters);
+    if (this.config.security.redactSecrets) text = redactSecrets(text);
+    if (!text || /[\r\n]/.test(text)) throw new Error("Corrected memory must be one non-empty line");
+    if (text === record.text) throw new Error("Corrected memory text must differ from the existing text");
+    const now = new Date().toISOString();
+    const source: MemorySource = {
+      actor: "assistant",
+      sessionId: this.sessionId,
+      cwd: this.cwd,
+      cause: "correction_of_inaccurate_assistant_memory",
+      reason: this.safeSourceText(reason, 500),
+      evidence: this.safeSourceText(text, 500),
+    };
+    const updated: MemoryRecord = {
+      ...record,
+      text,
+      source,
+      sourceHistory: [...(record.sourceHistory ?? []), record.source],
+      confidence: Math.min(record.confidence, this.config.assistantCapture.maximumConfidence),
+      priority: Math.min(record.priority ?? this.config.assistantCapture.priority, this.config.assistantCapture.priority),
+      updatedAt: now,
+      embeddingModel: this.embedder.model,
+    };
+    const [vector] = await this.embedder.embed([text], signal);
+    if (!vector) throw new Error("Embedding failed");
+    await this.store.upsert(updated, vector);
+    this.activity?.("memory.corrected", { id: memoryId, actor: "assistant", ...(this.config.activityLog.includeText ? { previousText: record.text, text, reason: source.reason } : {}) });
+    return updated;
+  }
+
   async sweepLifecycle(now = new Date()): Promise<{ initialized: number; expired: number }> {
     if (!this.config.memoryLifecycle.enabled) return { initialized: 0, expired: 0 };
     const records = await this.store.list({ status: "active", scopes: ["global", "project"], kinds: ["user_profile", "fact", "skill_workflow"], projectId: this.projectId }, 10000);

@@ -148,6 +148,7 @@ export interface ActiveMemoryPromptsConfig {
   steerFeedback: string;
   tools: {
     memoryStoreResult: ToolPromptConfig;
+    memoryCorrect: ToolPromptConfig;
     memorySearch: ToolPromptConfig;
     memoryFeedback: ToolPromptConfig;
   };

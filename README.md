@@ -123,7 +123,7 @@ All model-facing prompt text is configurable under `prompts`. Override only the 
 
 Every steer exposes its exact memory IDs. Legacy custom `steerFeedback` templates without `{{memoryIds}}` receive an appended ID line automatically, so `memory_feedback` always has the required identifier.
 
-`prompts.jsonOnly` configures the fast-model system instruction. The snippet and guideline arrays for `memory_store_result`, `memory_search`, and `memory_feedback` are under `prompts.tools`. Unknown placeholders are left unchanged, which makes partial migration of custom templates safe.
+`prompts.jsonOnly` configures the fast-model system instruction. The snippet and guideline arrays for `memory_store_result`, `memory_correct`, `memory_search`, and `memory_feedback` are under `prompts.tools`. Unknown placeholders are left unchanged, which makes partial migration of custom templates safe.
 
 ```json
 {
@@ -351,6 +351,10 @@ Semantic search with `global`, `project`, or `both` scope. Results include actor
 ### `memory_store_result`
 
 Stores a hard-won assistant result only during an active investigation that has exceeded the configured time gate. The tool requires calibrated confidence and a rationale, then independently validates, searches, and merges before writing. Long investigations are also considered automatically when the agent settles.
+
+### `memory_correct`
+
+Replaces an exact assistant-generated memory after the agent independently establishes that it is incorrect. The correction is re-embedded and retains the prior source in provenance history. It cannot change user-sourced memories and should not be used merely because a memory is stale, irrelevant, or redundant.
 
 ### `memory_feedback`
 
