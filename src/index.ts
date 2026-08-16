@@ -11,6 +11,7 @@ import { DAILY_SWEEP_POLL_INTERVAL_MS, DailySweepGate } from "./daily-sweep.js";
 import { reviewCompactionPair } from "./compaction-review.js";
 import { loadConfig, publicConfig, saveUserCompactionThreshold, saveUserMemoryLifecycle } from "./config.js";
 import { SteerFeedbackLedger } from "./feedback.js";
+import { ActiveMemoryFooterStatus } from "./footer-status.js";
 import { MemoryEngine, rankMemoryMatches } from "./memory-engine.js";
 import { activeMemoryStatus, compactionProgressStatus } from "./status.js";
 import { MemorySteerLimiter } from "./steer-frequency.js";
@@ -44,11 +45,18 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   let capturedCount = 0;
   let investigation: Investigation | undefined;
   const dailySweepGate = new DailySweepGate();
+  const footerStatus = new ActiveMemoryFooterStatus();
   let dailySweepTimer: ReturnType<typeof setInterval> | undefined;
 
   const setStatus = (ctx: ExtensionContext) => {
     if (!ctx.hasUI) return;
-    ctx.ui.setStatus("active-memory", `memory:${activeMemoryStatus(paused, lastError, recallInFlight)}`);
+    const status = `memory:${activeMemoryStatus(paused, lastError, recallInFlight)}`;
+    if (ctx.mode === "tui") {
+      footerStatus.set(status);
+      ctx.ui.setStatus("active-memory", undefined);
+    } else {
+      ctx.ui.setStatus("active-memory", status);
+    }
   };
 
   pi.registerMessageRenderer<SteerDetails>("active-memory-steer", (message, options, theme) => {
@@ -63,6 +71,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    if (ctx.mode === "tui") footerStatus.install();
     const thisGeneration = ++generation;
     paused = false; turns = 0; turnSequence = 0; toolResults = 0; thinkingCharacters = 0; lastError = undefined; investigation = undefined; initialRecallPrompt = undefined;
     config = await loadConfig(ctx.cwd, ctx.isProjectTrusted());
@@ -189,6 +198,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (event) => {
+    footerStatus.restore();
     generation++;
     if (dailySweepTimer) clearInterval(dailySweepTimer);
     dailySweepTimer = undefined;
