@@ -33,31 +33,10 @@ Influenced by the strongest ideas in `pi-hermes-memory`, `pi-semantic-memory`, `
 
 ## Install
 
-Install the latest release from [npm](https://www.npmjs.com/package/pi-active-memory):
+Install from [npm](https://www.npmjs.com/package/pi-active-memory):
 
 ```bash
 pi install npm:pi-active-memory
-```
-
-To pin the current release:
-
-```bash
-pi install npm:pi-active-memory@0.1.0
-```
-
-From a checkout:
-
-```bash
-git clone https://github.com/Rizhiy/pi-active-memory.git
-cd pi-active-memory
-npm install
-pi install "$(pwd)"
-```
-
-For development:
-
-```bash
-pi -e ./src/index.ts
 ```
 
 ## Default providers
@@ -363,8 +342,8 @@ The editor exposes JSON fields for `text`, `kind`, `scope`, `projectId`, `confid
 | `/memory-edit`                   | Fuzzy-find and edit a memory's text or metadata                      |
 | `/memory-list [global\|project]` | Inspect active memories and their IDs                                |
 | `/memory-forget [id-or-prefix]`  | Fuzzy-find and soft-delete a memory, or delete by a unique ID prefix |
-| `/memory-compact`                | Review related pairs and combine selected memories                    |
-| `/memory-settings`               | Configure extension settings, including compaction similarity         |
+| `/memory-compact`                | Review related pairs and combine selected memories                   |
+| `/memory-settings`               | Configure extension settings, including compaction similarity        |
 | `/memory-why`                    | Show IDs, scores, feedback token, and latest steer reason            |
 | `/memory-pause`                  | Pause automatic capture and recall for this session                  |
 | `/memory-resume`                 | Resume automation                                                    |
