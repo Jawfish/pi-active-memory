@@ -352,7 +352,7 @@ Stores a hard-won assistant result only during an active investigation that has 
 
 ### `memory_feedback`
 
-Rates one exact memory from one exact steer as `useful` or `unhelpful`, with a concrete reason. The tool requires the unguessable token included in that steer, accepts each token/memory pair once, and caps feedback per memory per session. Useful feedback raises confidence and renews lifecycle budgets; unhelpful feedback lowers confidence without renewing it. Full feedback provenance is retained in bounded history. The one-line steer display adds a green `🟢` for useful feedback or red `🔴` for unhelpful feedback beside the steer.
+Rates one exact memory from one exact steer as `useful` or `unhelpful`, with a concrete reason. Irrelevant steered memories should receive `unhelpful`; relevant but redundant memories receive no feedback; memories that change the planned work receive `useful`. The tool requires the unguessable token included in that steer, accepts each token/memory pair once, and caps feedback per memory per session. Useful feedback raises confidence and renews lifecycle budgets; unhelpful feedback lowers confidence without renewing it. Full feedback provenance is retained in bounded history. The one-line steer display adds a green `🟢` for useful feedback or red `🔴` for unhelpful feedback beside the steer.
 
 ### `memory_forget`
 
@@ -408,7 +408,7 @@ Useful feedback raises confidence and reduces `decayRate`, making repeatedly use
 
 A memory is never eligible for recall while its stored source user text or evidence still appears in Pi's active context after compaction processing. This suppression follows the actual active context rather than relying only on session IDs, so it also works across resumed/forked session files and stops once compaction removes the source passage.
 
-As an additional guard, a memory created in the current Pi session is not eligible for retrieval until it is 30 minutes old by default. The originating user message should still be available in the live context, so recalling it immediately would be redundant and could create feedback loops.
+As an additional guard, a memory created in the current Pi session is not eligible for retrieval until it is 30 minutes old by default. The originating user message should still be available in the live context, so recalling it immediately would be redundant and could create feedback loops. The recall judge also rejects topically relevant memories that add nothing beyond live context and is instructed to emit only novel memory-derived information rather than restating or blending in the current request.
 
 Configure the window with `recall.minimumMemoryAgeMinutes`; set it to `0` to disable suppression. The filter applies only when both conditions hold:
 

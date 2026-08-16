@@ -38,8 +38,12 @@ test("source context suppression recognizes stored user evidence", () => {
   assert.equal(sourceEvidenceAppearsInContext(record, "user: Update the task widget."), false);
 });
 
-test("transient task memory detection rejects temporary trials", () => {
+test("transient task memory detection rejects temporary trials and suspected bugs under investigation", () => {
   assert.equal(isTransientTaskMemory("The user wants to try pi-tasks for now.", "let's try it for now"), true);
+  assert.equal(isTransientTaskMemory(
+    "The memory system appears to create and immediately return memories.",
+    "This memory is basically my message plus thoughts. Inspect how it was created.",
+  ), true);
   assert.equal(isTransientTaskMemory("The user manages settings through cfg.", "I manage settings through cfg"), false);
 });
 

@@ -92,8 +92,12 @@ export function sourceEvidenceAppearsInContext(record: { source: { userText?: st
 }
 
 export function isTransientTaskMemory(text: string, evidence: string): boolean {
-  const value = normalizeText(`${text} ${evidence}`);
-  return /\b(for now|right now|this task|this session|current task|let(?:'|’)s try|want(?:s|ed)? to try|plan(?:s|ned)? to try)\b/.test(value);
+  const normalizedText = normalizeText(text);
+  const normalizedEvidence = normalizeText(evidence);
+  const value = `${normalizedText} ${normalizedEvidence}`;
+  if (/\b(for now|right now|this task|this session|current task|let(?:'|’)s try|want(?:s|ed)? to try|plan(?:s|ned)? to try)\b/.test(value)) return true;
+  return /\b(appears? to|seems? to|suspect(?:s|ed)?(?: that)?)\b/.test(normalizedText) &&
+    /\b(inspect|investigate|debug|diagnose|find out|fix)\b/.test(normalizedEvidence);
 }
 
 function normalizeText(value: string): string {
