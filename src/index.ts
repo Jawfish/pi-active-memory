@@ -733,13 +733,4 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
-    name: "memory_forget", label: "Forget Active Memory", description: "Soft-delete a memory by exact ID, excluding it from recall.",
-    parameters: Type.Object({ id: Type.String() }),
-    async execute(_id, params) {
-      if (!store) throw new Error("Memory store is not initialized");
-      const deleted = await store.markDeleted(params.id);
-      return { content: [{ type: "text", text: deleted ? `Soft-deleted ${params.id}` : `Memory ${params.id} not found` }], details: { id: params.id, deleted } };
-    },
-  });
 }

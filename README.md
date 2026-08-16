@@ -360,10 +360,6 @@ Replaces an exact assistant-generated memory after the agent independently estab
 
 Rates one exact memory from one exact steer as `useful` or `unhelpful`, with a concrete reason. Each steer includes both its feedback token and the exact eligible memory IDs. Irrelevant steered memories should receive `unhelpful`; relevant but redundant memories receive no feedback; memories that change the planned work receive `useful`. The tool requires the unguessable token included in that steer, accepts each token/memory pair once, and caps feedback per memory per session. Useful feedback raises confidence and renews lifecycle budgets; unhelpful feedback lowers confidence without renewing it. Full feedback provenance is retained in bounded history. The one-line steer display adds a green `🟢` for useful feedback or red `🔴` for unhelpful feedback beside the steer.
 
-### `memory_forget`
-
-Soft-delete by exact memory ID. Deleted records remain in storage for audit/recovery but are excluded from automatic and manual search.
-
 ## Memory editor and fuzzy finder
 
 Run `/memory` to search interactively across memory text, ID, scope, kind, status, and project metadata. Select a result and choose **Edit** or **Delete**. `/memory-edit` opens the same finder directly in edit mode, while `/memory-forget` opens it directly in delete mode.
@@ -378,7 +374,7 @@ The editor exposes JSON fields for `text`, `kind`, `scope`, `projectId`, `confid
 | `/memory`                        | Fuzzy-find a memory, then edit or delete it                          |
 | `/memory-edit`                   | Fuzzy-find and edit a memory's text or metadata                      |
 | `/memory-list [global\|project]` | Inspect active memories and their IDs                                |
-| `/memory-forget [id-or-prefix]`  | Fuzzy-find and soft-delete a memory, or delete by a unique ID prefix |
+| `/memory-forget [id-or-prefix]`  | User-only fuzzy-find and soft-delete, or delete by a unique ID prefix |
 | `/memory-compact`                | Review related pairs and combine selected memories                   |
 | `/memory-settings`               | Configure extension settings, including compaction similarity        |
 | `/memory-why`                    | Show IDs, scores, feedback token, and latest steer reason            |
