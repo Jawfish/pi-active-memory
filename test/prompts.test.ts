@@ -1,12 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assistantExtractionPrompt, assistantValidationPrompt, compactionPrompt, compactionValidationPrompt, DEFAULT_PROMPTS, extractionPrompt, judgePrompt, mergePrompt, queryPrompt, renderPrompt, validationPrompt } from "../src/prompts.js";
+import { assistantExtractionPrompt, assistantValidationPrompt, compactionPrompt, compactionValidationPrompt, DEFAULT_PROMPTS, extractionPrompt, judgePrompt, mergePrompt, queryPrompt, renderPrompt, steerFeedbackPrompt, validationPrompt } from "../src/prompts.js";
 
 test("configured templates interpolate documented placeholders", () => {
   const prompts = structuredClone(DEFAULT_PROMPTS);
   prompts.query = "Find {{context}} while preserving {{unknown}}";
   assert.equal(queryPrompt("the task", prompts), "Find the task while preserving {{unknown}}");
   assert.equal(renderPrompt("{{feedbackToken}}/{{feedbackToken}}", { feedbackToken: "token" }), "token/token");
+});
+
+test("steer feedback exposes exact memory IDs and preserves legacy custom templates", () => {
+  const ids = ["memory-a", "memory-b"];
+  const current = steerFeedbackPrompt(DEFAULT_PROMPTS.steerFeedback, "token", ids);
+  assert.match(current, /Memory feedback token: token/);
+  assert.match(current, /Exact memory IDs from this steer: \["memory-a","memory-b"\]/);
+
+  const legacy = steerFeedbackPrompt("[Token: {{feedbackToken}}.]", "token", ids);
+  assert.equal(legacy, "[Token: token.]\n[Exact memory IDs from this steer: [\"memory-a\",\"memory-b\"].]");
 });
 
 test("extraction prompt makes the user message the only evidence source", () => {

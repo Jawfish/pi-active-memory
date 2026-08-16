@@ -119,7 +119,9 @@ All model-facing prompt text is configurable under `prompts`. Override only the 
 | `compactionValidation` | `memories`, `proposed` |
 | `query` | `context` |
 | `judge` | `context`, `candidates` |
-| `steerFeedback` | `feedbackToken` |
+| `steerFeedback` | `feedbackToken`, `memoryIds` |
+
+Every steer exposes its exact memory IDs. Legacy custom `steerFeedback` templates without `{{memoryIds}}` receive an appended ID line automatically, so `memory_feedback` always has the required identifier.
 
 `prompts.jsonOnly` configures the fast-model system instruction. The snippet and guideline arrays for `memory_store_result`, `memory_search`, and `memory_feedback` are under `prompts.tools`. Unknown placeholders are left unchanged, which makes partial migration of custom templates safe.
 
@@ -127,7 +129,7 @@ All model-facing prompt text is configurable under `prompts`. Override only the 
 {
   "prompts": {
     "query": "Return a semantic memory query for this context as JSON: {{context}}",
-    "steerFeedback": "[Token: {{feedbackToken}}. Rate irrelevant memory unhelpful, plan-changing memory useful, and relevant but redundant memory not at all.]",
+    "steerFeedback": "[Token: {{feedbackToken}}. Memory IDs: {{memoryIds}}. Rate irrelevant memory unhelpful, plan-changing memory useful, and relevant but redundant memory not at all.]",
     "tools": {
       "memoryFeedback": {
         "guidelines": ["Use memory_feedback according to the configured relevance policy."]
@@ -352,7 +354,7 @@ Stores a hard-won assistant result only during an active investigation that has 
 
 ### `memory_feedback`
 
-Rates one exact memory from one exact steer as `useful` or `unhelpful`, with a concrete reason. Irrelevant steered memories should receive `unhelpful`; relevant but redundant memories receive no feedback; memories that change the planned work receive `useful`. The tool requires the unguessable token included in that steer, accepts each token/memory pair once, and caps feedback per memory per session. Useful feedback raises confidence and renews lifecycle budgets; unhelpful feedback lowers confidence without renewing it. Full feedback provenance is retained in bounded history. The one-line steer display adds a green `🟢` for useful feedback or red `🔴` for unhelpful feedback beside the steer.
+Rates one exact memory from one exact steer as `useful` or `unhelpful`, with a concrete reason. Each steer includes both its feedback token and the exact eligible memory IDs. Irrelevant steered memories should receive `unhelpful`; relevant but redundant memories receive no feedback; memories that change the planned work receive `useful`. The tool requires the unguessable token included in that steer, accepts each token/memory pair once, and caps feedback per memory per session. Useful feedback raises confidence and renews lifecycle budgets; unhelpful feedback lowers confidence without renewing it. Full feedback provenance is retained in bounded history. The one-line steer display adds a green `🟢` for useful feedback or red `🔴` for unhelpful feedback beside the steer.
 
 ### `memory_forget`
 

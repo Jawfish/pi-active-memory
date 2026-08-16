@@ -75,7 +75,7 @@ CONTEXT:
 
 MEMORIES:
 {{candidates}}`,
-  steerFeedback: "[Memory feedback token: {{feedbackToken}}. If a memory is irrelevant to the current work, call memory_feedback with unhelpful. If it is relevant but adds no new information, do not give feedback. If it changes your planned work, call memory_feedback with useful. Give feedback at most once per memory.]",
+  steerFeedback: "[Memory feedback token: {{feedbackToken}}. Exact memory IDs from this steer: {{memoryIds}}. If a memory is irrelevant to the current work, call memory_feedback with unhelpful. If it is relevant but adds no new information, do not give feedback. If it changes your planned work, call memory_feedback with useful. Give feedback at most once per memory.]",
   tools: {
     memoryStoreResult: {
       snippet: "Store a hard-won result after at least 60 seconds of investigation",
@@ -106,6 +106,14 @@ export function renderPrompt(template: string, values: PromptValues): string {
   return template.replace(/{{([A-Za-z][A-Za-z0-9]*)}}/g, (token, key: string) =>
     Object.hasOwn(values, key) ? String(values[key]) : token,
   );
+}
+
+export function steerFeedbackPrompt(template: string, feedbackToken: string, memoryIds: string[]): string {
+  const serializedIds = JSON.stringify(memoryIds);
+  const rendered = renderPrompt(template, { feedbackToken, memoryIds: serializedIds });
+  return template.includes("{{memoryIds}}")
+    ? rendered
+    : `${rendered}\n[Exact memory IDs from this steer: ${serializedIds}.]`;
 }
 
 export function extractionPrompt(userText: string, context: string, projectId: string, prompts = DEFAULT_PROMPTS): string {

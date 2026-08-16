@@ -13,7 +13,7 @@ import { DEFAULT_CONFIG, loadConfig, publicConfig, saveUserCompactionThreshold, 
 import { SteerFeedbackLedger } from "./feedback.js";
 import { ActiveMemoryFooterStatus } from "./footer-status.js";
 import { MemoryEngine, rankMemoryMatches } from "./memory-engine.js";
-import { renderPrompt } from "./prompts.js";
+import { renderPrompt, steerFeedbackPrompt } from "./prompts.js";
 import { activeMemoryStatus, compactionProgressStatus } from "./status.js";
 import { formatSteerSentence, orderedFeedbackOutcomes, type SteerFeedbackOutcome } from "./steer-display.js";
 import { MemorySteerLimiter } from "./steer-frequency.js";
@@ -280,7 +280,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           feedbackLedger.register(details.feedbackToken, details.memoryIds);
           lastRecall = details;
           const delivery = job.ctx.isIdle() ? "nextTurn" : "steer";
-          const feedbackHint = `\n\n${renderPrompt(config.prompts.steerFeedback, { feedbackToken: details.feedbackToken })}`;
+          const feedbackHint = `\n\n${steerFeedbackPrompt(config.prompts.steerFeedback, details.feedbackToken, details.memoryIds)}`;
           pi.sendMessage({ customType: "active-memory-steer", content: `${recalled.instruction}${feedbackHint}`, display: true, details }, { deliverAs: delivery, triggerTurn: false });
           activity?.log("steer.queued", { delivery, ...details, ...(config.activityLog.includeText ? { instruction: recalled.instruction } : {}) });
           lastError = undefined;
