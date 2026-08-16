@@ -106,6 +106,37 @@ export default ({ cwd }) => ({
 
 Precedence is defaults → global JSON → global code → trusted project JSON → trusted project code. Project files, including executable configuration, are read only when Pi trusts the project. Existing `database`, `embedding`, and `fastModel` JSON keys are migrated at load time.
 
+All model-facing prompt text is configurable under `prompts`. Override only the fields you need; nested defaults are preserved. Templates use `{{name}}` placeholders:
+
+| Prompt | Available placeholders |
+|---|---|
+| `extraction` | `userText`, `context`, `projectId` |
+| `validation` | `userText`, `context`, `candidate` |
+| `merge` | `candidate`, `matches`, `actor` |
+| `assistantExtraction` | `investigation`, `cause`, `elapsedSeconds`, `projectId` |
+| `assistantValidation` | `investigation`, `cause`, `elapsedSeconds`, `candidate` |
+| `compaction` | `memories` |
+| `compactionValidation` | `memories`, `proposed` |
+| `query` | `context` |
+| `judge` | `context`, `candidates` |
+| `steerFeedback` | `feedbackToken` |
+
+`prompts.jsonOnly` configures the fast-model system instruction. The snippet and guideline arrays for `memory_store_result`, `memory_search`, and `memory_feedback` are under `prompts.tools`. Unknown placeholders are left unchanged, which makes partial migration of custom templates safe.
+
+```json
+{
+  "prompts": {
+    "query": "Return a semantic memory query for this context as JSON: {{context}}",
+    "steerFeedback": "[Token: {{feedbackToken}}. Rate irrelevant memory unhelpful, plan-changing memory useful, and relevant but redundant memory not at all.]",
+    "tools": {
+      "memoryFeedback": {
+        "guidelines": ["Use memory_feedback according to the configured relevance policy."]
+      }
+    }
+  }
+}
+```
+
 ### Full example
 
 ```json

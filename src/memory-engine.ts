@@ -4,7 +4,7 @@ import { pairSimilarMemories, type CompactionProposal, type MemoryCluster } from
 import type { ActiveMemoryConfig, EmbeddingProvider, FastModelRunner, MemoryActor, MemoryKind, MemoryMatch, MemoryRecord, MemoryScope, MemorySource, VectorStore } from "./types.js";
 import { applyConfidenceFeedback, type FeedbackOutcome } from "./feedback.js";
 import { advanceMemoryLifecycle, initializeMemoryLifecycle, reinforceMemoryLifecycle } from "./lifecycle.js";
-import { assistantExtractionPrompt, assistantValidationPrompt, compactionPrompt, compactionValidationPrompt, extractionPrompt, JSON_ONLY, judgePrompt, mergePrompt, queryPrompt, validationPrompt } from "./prompts.js";
+import { assistantExtractionPrompt, assistantValidationPrompt, compactionPrompt, compactionValidationPrompt, extractionPrompt, judgePrompt, mergePrompt, queryPrompt, validationPrompt } from "./prompts.js";
 import { evidenceAppearsInUserMessage, isTransientTaskMemory, redactSecrets, sourceEvidenceAppearsInContext } from "./utils.js";
 
 interface Extracted { text: string; kind: MemoryKind; scope: MemoryScope; confidence: number; evidence: string }
@@ -28,7 +28,7 @@ export class MemoryEngine {
   async capture(userText: string, context: string, signal?: AbortSignal): Promise<number> {
     if (!this.config.capture.enabled || userText.trim().length < this.config.capture.minCharacters) return 0;
     this.activity?.("capture.started", { characters: userText.length, ...(this.config.activityLog.includeText ? { userText } : {}) });
-    const result = await this.fast.json<{ memories?: Extracted[] }>(JSON_ONLY, extractionPrompt(userText, context, this.projectId), signal);
+    const result = await this.fast.json<{ memories?: Extracted[] }>(this.config.prompts.jsonOnly, extractionPrompt(userText, context, this.projectId, this.config.prompts), signal);
     this.activity?.("capture.extracted", {
       count: result.memories?.length ?? 0,
       memories: (result.memories ?? []).map((memory) => ({ kind: memory.kind, scope: memory.scope, confidence: memory.confidence, evidenceValid: typeof memory.evidence === "string" && evidenceAppearsInUserMessage(memory.evidence, userText), ...(this.config.activityLog.includeText ? { text: memory.text, evidence: memory.evidence } : {}) })),
@@ -45,8 +45,8 @@ export class MemoryEngine {
       }
       const validate = async (text: string) => {
         const validation = await this.fast.json<{ accept?: boolean; reason?: string }>(
-          JSON_ONLY,
-          validationPrompt(userText, context, { text, kind: raw.kind, scope: raw.scope, evidence: raw.evidence }),
+          this.config.prompts.jsonOnly,
+          validationPrompt(userText, context, { text, kind: raw.kind, scope: raw.scope, evidence: raw.evidence }, this.config.prompts),
           signal,
         );
         this.activity?.("capture.validated", { accept: validation.accept === true, reason: validation.reason ?? "", fastModel: this.fast.selectedModel() });
@@ -76,8 +76,8 @@ export class MemoryEngine {
     if (!this.config.assistantCapture.enabled || elapsedMs < this.config.assistantCapture.minimumElapsedMs || !investigation.trim()) return 0;
     this.activity?.("assistant_capture.started", { elapsedMs, characters: investigation.length, ...(this.config.activityLog.includeText ? { cause } : {}) });
     const result = await this.fast.json<{ memories?: AssistantExtracted[] }>(
-      JSON_ONLY,
-      assistantExtractionPrompt(investigation, cause, elapsedMs, this.projectId),
+      this.config.prompts.jsonOnly,
+      assistantExtractionPrompt(investigation, cause, elapsedMs, this.projectId, this.config.prompts),
       signal,
     );
     let stored = 0;
@@ -187,8 +187,8 @@ export class MemoryEngine {
     const proposals: CompactionProposal[] = [];
     for (const cluster of clusters) {
       const decision = await this.fast.json<{ merge?: boolean; text?: string; reason?: string }>(
-        JSON_ONLY,
-        compactionPrompt(cluster.records.map((record) => ({ id: record.id, text: record.text }))),
+        this.config.prompts.jsonOnly,
+        compactionPrompt(cluster.records.map((record) => ({ id: record.id, text: record.text })), this.config.prompts),
         signal,
       );
       const longest = Math.max(...cluster.records.map((record) => record.text.length));
@@ -216,8 +216,8 @@ export class MemoryEngine {
     if (this.config.security.redactSecrets) text = redactSecrets(text);
     if (!text || /[\r\n]/.test(text)) throw new Error("Compacted memory must be one non-empty line");
     const validation = await this.fast.json<{ accept?: boolean; reason?: string }>(
-      JSON_ONLY,
-      compactionValidationPrompt(records.map((record) => ({ id: record.id, text: record.text })), text),
+      this.config.prompts.jsonOnly,
+      compactionValidationPrompt(records.map((record) => ({ id: record.id, text: record.text })), text, this.config.prompts),
       signal,
     );
     if (validation.accept !== true) throw new Error(`Compaction validation failed: ${validation.reason ?? "merge was not entailed by every source"}`);
@@ -277,7 +277,7 @@ export class MemoryEngine {
   async recall(context: string, signal?: AbortSignal, excludedIds: ReadonlySet<string> = new Set(), activeContext = context): Promise<RecallResult | undefined> {
     if (!this.config.recall.enabled || !context.trim()) return undefined;
     this.activity?.("recall.started", { contextCharacters: context.length });
-    const query = await this.fast.json<{ query?: string }>(JSON_ONLY, queryPrompt(context), signal);
+    const query = await this.fast.json<{ query?: string }>(this.config.prompts.jsonOnly, queryPrompt(context, this.config.prompts), signal);
     this.activity?.("recall.query", { query: this.config.activityLog.includeText ? query.query ?? "" : undefined, fastModel: this.fast.selectedModel() });
     if (!query.query?.trim()) return undefined;
     const [vector] = await this.embedder.embed([query.query.trim()], signal);
@@ -298,7 +298,7 @@ export class MemoryEngine {
     this.activity?.("recall.matches", { matches: matches.map((match) => ({ id: match.record.id, score: match.score, scope: match.record.scope, kind: match.record.kind, actor: memoryActor(match.record), confidence: match.record.confidence, ...(this.config.activityLog.includeText ? { text: match.record.text } : {}) })) });
     if (!matches.length) return undefined;
     const candidates = matches.map((match) => `${match.record.id} rank=${match.score.toFixed(3)} source=${memoryActor(match.record)} confidence=${match.record.confidence.toFixed(2)} scope=${match.record.scope} kind=${match.record.kind}\n${match.record.text}`).join("\n\n");
-    const judged = await this.fast.json<{ relevantIds?: string[]; instruction?: string; reason?: string }>(JSON_ONLY, judgePrompt(context, candidates), signal);
+    const judged = await this.fast.json<{ relevantIds?: string[]; instruction?: string; reason?: string }>(this.config.prompts.jsonOnly, judgePrompt(context, candidates, this.config.prompts), signal);
     const ids = new Set(judged.relevantIds ?? []);
     const relevant = matches.filter((match) => ids.has(match.record.id));
     this.activity?.("recall.judged", {
@@ -323,8 +323,8 @@ export class MemoryEngine {
 
   private async validateAssistantCandidate(investigation: string, cause: string, elapsedMs: number, candidate: AssistantExtracted, signal?: AbortSignal): Promise<boolean> {
     const validation = await this.fast.json<{ accept?: boolean; reason?: string }>(
-      JSON_ONLY,
-      assistantValidationPrompt(investigation, cause, elapsedMs, candidate),
+      this.config.prompts.jsonOnly,
+      assistantValidationPrompt(investigation, cause, elapsedMs, candidate, this.config.prompts),
       signal,
     );
     this.activity?.("assistant_capture.validated", { accept: validation.accept === true, reason: validation.reason ?? "", fastModel: this.fast.selectedModel() });
@@ -361,8 +361,8 @@ export class MemoryEngine {
     if (plausible.length) {
       const existing = plausible.map((match) => `${match.record.id} (${match.score.toFixed(3)}, source=${memoryActor(match.record)}, confidence=${match.record.confidence.toFixed(2)}): ${match.record.text}`).join("\n");
       const decision = await this.fast.json<{ action?: "add" | "replace" | "noop"; targetId?: string | null; text?: string }>(
-        JSON_ONLY,
-        mergePrompt(text, existing, source.actor ?? "user"),
+        this.config.prompts.jsonOnly,
+        mergePrompt(text, existing, source.actor ?? "user", this.config.prompts),
         signal,
       );
       action = decision.action ?? "add";

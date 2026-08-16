@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assistantExtractionPrompt, assistantValidationPrompt, compactionPrompt, compactionValidationPrompt, extractionPrompt, mergePrompt, validationPrompt } from "../src/prompts.js";
+import { assistantExtractionPrompt, assistantValidationPrompt, compactionPrompt, compactionValidationPrompt, DEFAULT_PROMPTS, extractionPrompt, mergePrompt, queryPrompt, renderPrompt, validationPrompt } from "../src/prompts.js";
+
+test("configured templates interpolate documented placeholders", () => {
+  const prompts = structuredClone(DEFAULT_PROMPTS);
+  prompts.query = "Find {{context}} while preserving {{unknown}}";
+  assert.equal(queryPrompt("the task", prompts), "Find the task while preserving {{unknown}}");
+  assert.equal(renderPrompt("{{feedbackToken}}/{{feedbackToken}}", { feedbackToken: "token" }), "token/token");
+});
 
 test("extraction prompt makes the user message the only evidence source", () => {
   const prompt = extractionPrompt("I prefer it.", "assistant: it refers to early returns", "project");

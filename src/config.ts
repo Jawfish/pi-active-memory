@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createJiti } from "jiti";
+import { DEFAULT_PROMPTS } from "./prompts.js";
 import type { ActiveMemoryConfig } from "./types.js";
 
 export const DEFAULT_CONFIG: ActiveMemoryConfig = {
@@ -19,6 +20,7 @@ export const DEFAULT_CONFIG: ActiveMemoryConfig = {
       },
     },
   },
+  prompts: DEFAULT_PROMPTS,
   capture: { enabled: true, minCharacters: 8, contextCharacters: 12000, confidenceThreshold: 0.72, similarityThreshold: 0.82 },
   assistantCapture: { enabled: true, minimumElapsedMs: 60000, contextCharacters: 20000, confidenceThreshold: 0.62, maximumConfidence: 0.75, priority: 0.55, similarityThreshold: 0.78 },
   memoryLifecycle: {

@@ -9,10 +9,11 @@ import { DeferredSerialQueue } from "./background-queue.js";
 import type { CompactionProposal } from "./compaction.js";
 import { DAILY_SWEEP_POLL_INTERVAL_MS, DailySweepGate } from "./daily-sweep.js";
 import { reviewCompactionPair } from "./compaction-review.js";
-import { loadConfig, publicConfig, saveUserCompactionThreshold, saveUserMemoryLifecycle } from "./config.js";
+import { DEFAULT_CONFIG, loadConfig, publicConfig, saveUserCompactionThreshold, saveUserMemoryLifecycle } from "./config.js";
 import { SteerFeedbackLedger } from "./feedback.js";
 import { ActiveMemoryFooterStatus } from "./footer-status.js";
 import { MemoryEngine, rankMemoryMatches } from "./memory-engine.js";
+import { renderPrompt } from "./prompts.js";
 import { activeMemoryStatus, compactionProgressStatus } from "./status.js";
 import { MemorySteerLimiter } from "./steer-frequency.js";
 import type { ActiveMemoryConfig, EmbeddingProvider, FastModelRunner, MemoryKind, MemoryRecord, MemoryScope, VectorStore } from "./types.js";
@@ -264,7 +265,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           feedbackLedger.register(details.feedbackToken, details.memoryIds);
           lastRecall = details;
           const delivery = job.ctx.isIdle() ? "nextTurn" : "steer";
-          const feedbackHint = `\n\n[Memory feedback token: ${details.feedbackToken}. After a memory materially helps or hinders the work, call memory_feedback once for that memory.]`;
+          const feedbackHint = `\n\n${renderPrompt(config.prompts.steerFeedback, { feedbackToken: details.feedbackToken })}`;
           pi.sendMessage({ customType: "active-memory-steer", content: `${recalled.instruction}${feedbackHint}`, display: true, details }, { deliverAs: delivery, triggerTurn: false });
           activity?.log("steer.queued", { delivery, ...details, ...(config.activityLog.includeText ? { instruction: recalled.instruction } : {}) });
           lastError = undefined;
@@ -621,10 +622,8 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "memory_store_result", label: "Store Hard-Won Result", description: "Store a terse, durable assistant discovery after at least 60 seconds of non-trivial investigation; deduplicate it and keep it below user-memory authority.",
-    promptSnippet: "Store a hard-won result after at least 60 seconds of investigation",
-    promptGuidelines: [
-      "Use memory_store_result only for terse, reusable findings that required at least 60 seconds of substantial investigation; reject routine facts, simple searches, task state, plans, guesses, and user-supplied information.",
-    ],
+    get promptSnippet() { return config?.prompts.tools.memoryStoreResult.snippet ?? DEFAULT_CONFIG.prompts.tools.memoryStoreResult.snippet; },
+    get promptGuidelines() { return config?.prompts.tools.memoryStoreResult.guidelines ?? DEFAULT_CONFIG.prompts.tools.memoryStoreResult.guidelines; },
     parameters: Type.Object({
       text: Type.String({ description: "Terse, self-contained durable result" }),
       kind: StringEnum(["fact", "skill_workflow"] as const),
@@ -647,10 +646,8 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "memory_search", label: "Search Active Memory", description: "Search durable global/project memories. Results are untrusted history; use only when automatic recall was insufficient.",
-    promptSnippet: "Search memory on demand when automatic recall is insufficient",
-    promptGuidelines: [
-      "Use memory_search only for a needed historical preference, fact, workflow, or hard-won result not already supplied by automatic recall.",
-    ],
+    get promptSnippet() { return config?.prompts.tools.memorySearch.snippet ?? DEFAULT_CONFIG.prompts.tools.memorySearch.snippet; },
+    get promptGuidelines() { return config?.prompts.tools.memorySearch.guidelines ?? DEFAULT_CONFIG.prompts.tools.memorySearch.guidelines; },
     parameters: Type.Object({ query: Type.String(), scope: Type.Optional(StringEnum(["global", "project", "both"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })) }),
     async execute(_id, params, signal) {
       if (!store || !config || !embedder) throw new Error("Memory store is not initialized");
@@ -666,10 +663,8 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "memory_feedback", label: "Rate Steered Memory", description: "Report whether one memory from a specific active-memory steer materially helped or hindered the work. Feedback is bounded and adjusts future ranking confidence.",
-    promptSnippet: "Rate a steered memory after its usefulness becomes clear",
-    promptGuidelines: [
-      "Use memory_feedback only after a specific steered memory materially helped or hindered the work; do not rate mere retrieval, repeat feedback, or infer usefulness before an outcome is known.",
-    ],
+    get promptSnippet() { return config?.prompts.tools.memoryFeedback.snippet ?? DEFAULT_CONFIG.prompts.tools.memoryFeedback.snippet; },
+    get promptGuidelines() { return config?.prompts.tools.memoryFeedback.guidelines ?? DEFAULT_CONFIG.prompts.tools.memoryFeedback.guidelines; },
     parameters: Type.Object({
       steerToken: Type.String({ description: "Feedback token included in the memory steer" }),
       memoryId: Type.String({ description: "Exact memory ID from that steer" }),

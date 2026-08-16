@@ -129,9 +129,34 @@ export interface ActiveMemoryProvidersConfig {
   llm: AdapterSelection;
 }
 
+export interface ToolPromptConfig {
+  snippet: string;
+  guidelines: string[];
+}
+
+export interface ActiveMemoryPromptsConfig {
+  jsonOnly: string;
+  extraction: string;
+  validation: string;
+  merge: string;
+  assistantExtraction: string;
+  assistantValidation: string;
+  compaction: string;
+  compactionValidation: string;
+  query: string;
+  judge: string;
+  steerFeedback: string;
+  tools: {
+    memoryStoreResult: ToolPromptConfig;
+    memorySearch: ToolPromptConfig;
+    memoryFeedback: ToolPromptConfig;
+  };
+}
+
 export interface ActiveMemoryConfig {
   enabled: boolean;
   providers: ActiveMemoryProvidersConfig;
+  prompts: ActiveMemoryPromptsConfig;
   capture: {
     enabled: boolean;
     minCharacters: number;

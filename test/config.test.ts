@@ -42,6 +42,29 @@ test("grouped memory lifecycle settings persist without clobbering other configu
   }
 });
 
+test("prompt templates can be overridden individually without losing defaults", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "active-memory-prompts-config-"));
+  const cwd = join(directory, "project");
+  const agentDir = join(directory, "agent");
+  try {
+    await mkdir(cwd, { recursive: true });
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(join(agentDir, "active-memory.json"), JSON.stringify({
+      prompts: {
+        query: "CUSTOM QUERY: {{context}}",
+        tools: { memoryFeedback: { guidelines: ["Custom feedback policy"] } },
+      },
+    }));
+    const config = await loadConfig(cwd, false, agentDir);
+    assert.equal(config.prompts.query, "CUSTOM QUERY: {{context}}");
+    assert.match(config.prompts.extraction, /NEWEST USER MESSAGE/);
+    assert.equal(config.prompts.tools.memoryFeedback.snippet, DEFAULT_CONFIG.prompts.tools.memoryFeedback.snippet);
+    assert.deepEqual(config.prompts.tools.memoryFeedback.guidelines, ["Custom feedback policy"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("legacy provider configuration migrates to independent adapter selections", async () => {
   const directory = await mkdtemp(join(tmpdir(), "active-memory-provider-migration-"));
   const cwd = join(directory, "project");
