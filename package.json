@@ -62,5 +62,8 @@
   "homepage": "https://github.com/Rizhiy/pi-active-memory#readme",
   "bugs": {
     "url": "https://github.com/Rizhiy/pi-active-memory/issues"
+  },
+  "dependencies": {
+    "jiti": "^2.7.0"
   }
 }

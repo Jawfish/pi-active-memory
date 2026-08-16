@@ -1,4 +1,4 @@
-import { complete } from "@earendil-works/pi-ai/compat";
+import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { uuidv7 } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { FastModelConfig, FastModelRunner } from "./types.js";
@@ -6,7 +6,11 @@ import { parseJsonResponse } from "./utils.js";
 
 export class PiFastModel implements FastModelRunner {
   private selected?: string;
-  constructor(private readonly config: FastModelConfig, private readonly ctx: ExtensionContext) {}
+  constructor(
+    private readonly config: FastModelConfig,
+    private readonly ctx: ExtensionContext,
+    private readonly completeModel: typeof completeSimple = completeSimple,
+  ) {}
   selectedModel(): string | undefined { return this.selected; }
 
   async json<T>(system: string, prompt: string, signal?: AbortSignal): Promise<T> {
@@ -21,14 +25,17 @@ export class PiFastModel implements FastModelRunner {
       const auth = await this.ctx.modelRegistry.getApiKeyAndHeaders(model);
       if (!auth.ok || !auth.apiKey) { errors.push(`${reference}: ${auth.ok ? "no authentication" : auth.error}`); continue; }
       try {
-        const response = await complete(model, {
+        const response = await this.completeModel(model, {
           systemPrompt: system,
           messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
         }, {
           apiKey: auth.apiKey, headers: auth.headers, env: auth.env,
-          reasoningEffort: this.config.thinking, maxTokens: this.config.maxTokens,
+          reasoning: this.config.thinking === "off" ? undefined : this.config.thinking, maxTokens: this.config.maxTokens,
           cacheRetention: "none", signal, sessionId: uuidv7(),
         });
+        if (response.stopReason === "error" || response.stopReason === "aborted") {
+          throw new Error(response.errorMessage || `Model stopped with ${response.stopReason}`);
+        }
         const text = response.content.filter((part): part is { type: "text"; text: string } => part.type === "text").map((part) => part.text).join("\n");
         this.selected = reference;
         return parseJsonResponse<T>(text);

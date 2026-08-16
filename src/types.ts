@@ -77,6 +77,11 @@ export interface VectorStore {
   close(): Promise<void>;
 }
 
+export interface EmbeddingProvider {
+  readonly model: string;
+  embed(texts: string[], signal?: AbortSignal): Promise<number[][]>;
+}
+
 export interface EmbeddingConfig {
   provider: "openai" | "ollama" | "openai-compatible";
   model: string;
@@ -113,13 +118,20 @@ export interface MemoryLifecycleConfig {
   };
 }
 
+export interface AdapterSelection {
+  adapter: string;
+  config: Record<string, unknown>;
+}
+
+export interface ActiveMemoryProvidersConfig {
+  rag: AdapterSelection;
+  embedding: AdapterSelection;
+  llm: AdapterSelection;
+}
+
 export interface ActiveMemoryConfig {
   enabled: boolean;
-  database:
-    | { provider: "json"; path: string }
-    | { provider: "qdrant"; url: string; collection: string; apiKeyEnv?: string };
-  embedding: EmbeddingConfig;
-  fastModel: FastModelConfig;
+  providers: ActiveMemoryProvidersConfig;
   capture: {
     enabled: boolean;
     minCharacters: number;
@@ -162,4 +174,22 @@ export interface ActiveMemoryConfig {
 export interface FastModelRunner {
   json<T>(system: string, prompt: string, signal?: AbortSignal): Promise<T>;
   selectedModel(): string | undefined;
+}
+
+export interface ActiveMemoryAdapterContext {
+  cwd: string;
+  projectId: string;
+  sessionId: string;
+  extensionContext: import("@earendil-works/pi-coding-agent").ExtensionContext;
+}
+
+export type ActiveMemoryAdapterFactory<T> = (
+  config: Record<string, unknown>,
+  context: ActiveMemoryAdapterContext,
+) => T | Promise<T>;
+
+export interface ActiveMemoryAdapterRegistry {
+  registerRag(id: string, factory: ActiveMemoryAdapterFactory<VectorStore>): void;
+  registerEmbedding(id: string, factory: ActiveMemoryAdapterFactory<EmbeddingProvider>): void;
+  registerLlm(id: string, factory: ActiveMemoryAdapterFactory<FastModelRunner>): void;
 }

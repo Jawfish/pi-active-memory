@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, saveUserCompactionThreshold, saveUserMemoryLifecycle } from "../src/config.js";
+import { DEFAULT_CONFIG, loadConfig, saveUserCompactionThreshold, saveUserMemoryLifecycle } from "../src/config.js";
 
 test("user compaction setting preserves unrelated extension configuration", async () => {
   const directory = await mkdtemp(join(tmpdir(), "active-memory-config-"));
@@ -37,6 +37,52 @@ test("grouped memory lifecycle settings persist without clobbering other configu
     assert.equal(saved.memoryLifecycle.decay.initialRate, 0.2);
     assert.equal(saved.memoryLifecycle.confidence.deletionThreshold, 0.1);
     assert.equal(saved.memoryLifecycle.feedback.historyLimit, 50);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy provider configuration migrates to independent adapter selections", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "active-memory-provider-migration-"));
+  const cwd = join(directory, "project");
+  const agentDir = join(directory, "agent");
+  try {
+    await mkdir(cwd, { recursive: true });
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(join(agentDir, "active-memory.json"), JSON.stringify({
+      database: { provider: "qdrant", url: "http://qdrant", collection: "memories" },
+      embedding: { provider: "ollama", model: "embed", baseUrl: "http://ollama" },
+      fastModel: { candidates: ["openai-codex/test"], thinking: "low", maxTokens: 42 },
+    }));
+    const config = await loadConfig(cwd, false, agentDir);
+    assert.deepEqual(config.providers.rag, { adapter: "qdrant", config: { url: "http://qdrant", collection: "memories" } });
+    assert.deepEqual(config.providers.embedding, { adapter: "ollama", config: { model: "embed", baseUrl: "http://ollama" } });
+    assert.deepEqual(config.providers.llm, { adapter: "pi-model", config: { candidates: ["openai-codex/test"], thinking: "low", maxTokens: 42 } });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("trusted TypeScript configuration as code overlays JSON configuration", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "active-memory-code-config-"));
+  const cwd = join(directory, "project");
+  const agentDir = join(directory, "agent");
+  const projectDir = join(cwd, ".pi");
+  try {
+    await mkdir(projectDir, { recursive: true });
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(join(agentDir, "active-memory.json"), JSON.stringify({ recall: { topK: 3 } }));
+    await writeFile(join(agentDir, "active-memory.config.ts"), "export default ({ cwd }) => ({ activityLog: { includeText: cwd.endsWith('project') } });");
+    await writeFile(join(projectDir, "active-memory.config.ts"), "export default { providers: { llm: { adapter: 'custom-llm', config: { tier: 'subscription' } } } };" );
+
+    const untrusted = await loadConfig(cwd, false, agentDir);
+    assert.equal(untrusted.recall.topK, 3);
+    assert.equal(untrusted.activityLog.includeText, true);
+    assert.equal(untrusted.providers.llm.adapter, "pi-model");
+
+    const trusted = await loadConfig(cwd, true, agentDir);
+    assert.equal(trusted.providers.llm.adapter, "custom-llm");
+    assert.deepEqual(trusted.providers.llm.config, { tier: "subscription" });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -79,6 +79,21 @@ test("capture rejects transient task instructions after semantic validation", as
   assert.equal(store.records.length, 0);
 });
 
+test("capture deterministically rejects temporary try-it-for-now state", async () => {
+  const store = new Store();
+  const subject = engine({
+    memories: [{
+      text: "The user installed pi-tasks and wants to try it for now.",
+      kind: "fact",
+      scope: "project",
+      confidence: 0.99,
+      evidence: "I've installed pi-tasks; let's try it for now",
+    }],
+  }, store);
+  assert.equal(await subject.capture("I've installed pi-tasks; let's try it for now.", ""), 0);
+  assert.equal(store.records.length, 0);
+});
+
 test("assistant capture is time-gated and stores lower-priority provenance", async () => {
   const store = new Store();
   const subject = engine([
@@ -157,6 +172,26 @@ test("recall excludes recent current-session memory but keeps older and other-se
   ], store);
   const recalled = await subject.recall("current task");
   assert.deepEqual(recalled?.relevant.map((match) => match.record.id), ["old", "other"]);
+});
+
+test("recall suppresses a memory while its source text remains in active context", async () => {
+  const store = new Store();
+  const record = {
+    ...memory("installed-tool", "older-session", "2020-01-01T00:00:00Z"),
+    source: {
+      actor: "user" as const,
+      sessionId: "older-session",
+      cwd: "/cwd",
+      cause: "explicit_user_statement",
+      reason: "fixture",
+      userText: "I've installed pi-tasks; let's try it for now.",
+      evidence: "let's try it for now",
+    },
+  };
+  store.matches = [{ record, score: 0.95 }];
+  const subject = engine({ query: "pi tasks" }, store);
+  const recalled = await subject.recall("current task", undefined, new Set(), "user: I've installed pi-tasks; let's try it for now.");
+  assert.equal(recalled, undefined);
 });
 
 test("lifecycle sweep migrates legacy records and soft-deletes expired records", async () => {

@@ -50,7 +50,7 @@ export function textFromContent(content: unknown, includeThinking = false): stri
   }).join("\n");
 }
 
-export function boundedContext(entries: readonly unknown[], maxCharacters: number): string {
+export function contextText(entries: readonly unknown[]): string {
   const sections: string[] = [];
   for (const raw of entries) {
     const entry = raw as { type?: string; message?: { role?: string; content?: unknown; customType?: string } };
@@ -58,7 +58,11 @@ export function boundedContext(entries: readonly unknown[], maxCharacters: numbe
     const text = textFromContent(entry.message.content, true).trim();
     if (text) sections.push(`${entry.message.role}: ${text}`);
   }
-  return sections.join("\n\n").slice(-maxCharacters);
+  return sections.join("\n\n");
+}
+
+export function boundedContext(entries: readonly unknown[], maxCharacters: number): string {
+  return contextText(entries).slice(-maxCharacters);
 }
 
 export function boundedAssistantInvestigation(entries: readonly unknown[], maxCharacters: number): string {
@@ -74,7 +78,24 @@ export function boundedAssistantInvestigation(entries: readonly unknown[], maxCh
 }
 
 export function evidenceAppearsInUserMessage(evidence: string, userText: string): boolean {
-  const normalize = (value: string) => value.toLocaleLowerCase().replace(/\s+/g, " ").trim();
-  const quote = normalize(evidence);
-  return quote.length >= 3 && normalize(userText).includes(quote);
+  const quote = normalizeText(evidence);
+  return quote.length >= 3 && normalizeText(userText).includes(quote);
+}
+
+export function sourceEvidenceAppearsInContext(record: { source: { userText?: string; evidence?: string } }, context: string): boolean {
+  const normalizedContext = normalizeText(context);
+  const candidates = [record.source.userText, record.source.evidence]
+    .filter((value): value is string => typeof value === "string")
+    .map(normalizeText)
+    .filter((value) => value.length >= 8);
+  return candidates.some((value) => normalizedContext.includes(value));
+}
+
+export function isTransientTaskMemory(text: string, evidence: string): boolean {
+  const value = normalizeText(`${text} ${evidence}`);
+  return /\b(for now|right now|this task|this session|current task|let(?:'|’)s try|want(?:s|ed)? to try|plan(?:s|ned)? to try)\b/.test(value);
+}
+
+function normalizeText(value: string): string {
+  return value.toLocaleLowerCase().replace(/[’]/g, "'").replace(/\s+/g, " ").trim();
 }

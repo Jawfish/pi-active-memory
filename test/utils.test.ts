@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { boundedAssistantInvestigation, cosineSimilarity, evidenceAppearsInUserMessage, parseJsonResponse, redactSecrets, stableProjectId } from "../src/utils.js";
+import { boundedAssistantInvestigation, cosineSimilarity, evidenceAppearsInUserMessage, isTransientTaskMemory, parseJsonResponse, redactSecrets, sourceEvidenceAppearsInContext, stableProjectId } from "../src/utils.js";
 
 test("cosine similarity ranks identical vectors", () => {
   assert.equal(cosineSimilarity([1, 0], [1, 0]), 1);
@@ -30,6 +30,17 @@ test("assistant investigation context excludes user messages", () => {
 test("memory evidence must appear in the explicit user message", () => {
   assert.equal(evidenceAppearsInUserMessage("favourite color is orange", "My favourite   color is orange."), true);
   assert.equal(evidenceAppearsInUserMessage("use tabs", "Please fix the formatter"), false);
+});
+
+test("source context suppression recognizes stored user evidence", () => {
+  const record = { source: { userText: "I've installed pi-tasks; let's try it for now.", evidence: "let's try it for now" } };
+  assert.equal(sourceEvidenceAppearsInContext(record, "user: I've installed pi-tasks; let's try it for now."), true);
+  assert.equal(sourceEvidenceAppearsInContext(record, "user: Update the task widget."), false);
+});
+
+test("transient task memory detection rejects temporary trials", () => {
+  assert.equal(isTransientTaskMemory("The user wants to try pi-tasks for now.", "let's try it for now"), true);
+  assert.equal(isTransientTaskMemory("The user manages settings through cfg.", "I manage settings through cfg"), false);
 });
 
 test("project ids are stable and remote-sensitive", () => {

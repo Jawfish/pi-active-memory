@@ -4,21 +4,18 @@ import { Container, fuzzyFilter, Input, SettingsList, Text, truncateToWidth, typ
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { ActivityLogger } from "./activity-log.js";
+import { ACTIVE_MEMORY_ADAPTER_EVENT, createBuiltInAdapterRegistry } from "./adapters.js";
 import { DeferredSerialQueue } from "./background-queue.js";
 import type { CompactionProposal } from "./compaction.js";
 import { DAILY_SWEEP_POLL_INTERVAL_MS, DailySweepGate } from "./daily-sweep.js";
 import { reviewCompactionPair } from "./compaction-review.js";
 import { loadConfig, publicConfig, saveUserCompactionThreshold, saveUserMemoryLifecycle } from "./config.js";
-import { Embedder } from "./embeddings.js";
-import { PiFastModel } from "./fast-model.js";
 import { SteerFeedbackLedger } from "./feedback.js";
 import { MemoryEngine, rankMemoryMatches } from "./memory-engine.js";
-import { JsonVectorStore } from "./stores/json-store.js";
-import { QdrantVectorStore } from "./stores/qdrant-store.js";
 import { activeMemoryStatus, compactionProgressStatus } from "./status.js";
 import { MemorySteerLimiter } from "./steer-frequency.js";
-import type { ActiveMemoryConfig, MemoryKind, MemoryRecord, MemoryScope, VectorStore } from "./types.js";
-import { boundedAssistantInvestigation, boundedContext, redactSecrets, stableProjectId, textFromContent } from "./utils.js";
+import type { ActiveMemoryConfig, EmbeddingProvider, FastModelRunner, MemoryKind, MemoryRecord, MemoryScope, VectorStore } from "./types.js";
+import { boundedAssistantInvestigation, boundedContext, contextText, redactSecrets, stableProjectId, textFromContent } from "./utils.js";
 
 interface SteerDetails { memoryIds: string[]; scores: number[]; reason: string; projectId: string; feedbackToken: string; source: "active-memory" }
 interface Investigation { startedAt: number; cause: string; toolResults: number; startEntryCount?: number }
@@ -29,7 +26,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   let config: ActiveMemoryConfig | undefined;
   let store: VectorStore | undefined;
   let activity: ActivityLogger | undefined;
-  let embedder: Embedder | undefined;
+  let embedder: EmbeddingProvider | undefined;
   let engine: MemoryEngine | undefined;
   let projectId = "uninitialized";
   let paused = false;
@@ -38,7 +35,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   let steerLimiter: MemorySteerLimiter | undefined;
   let feedbackLedger = new SteerFeedbackLedger();
   let recallInFlight = false;
-  let recallPending: { ctx: ExtensionContext; context: string; generation: number } | undefined;
+  let recallPending: { ctx: ExtensionContext; context: string; activeContext: string; generation: number } | undefined;
   let turns = 0, turnSequence = 0, toolResults = 0, thinkingCharacters = 0;
   let lastSteerAt = 0;
   let lastSteerFingerprint = "";
@@ -82,18 +79,21 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       config.activityLog.enabled,
     );
     activity.log("session.started", { cwd: ctx.cwd, config: publicConfig(config) });
-    store = config.database.provider === "json"
-      ? new JsonVectorStore(config.database.path)
-      : new QdrantVectorStore(config.database.url, config.database.collection, config.database.apiKeyEnv ? process.env[config.database.apiKeyEnv] : undefined);
+    const adapters = createBuiltInAdapterRegistry();
+    pi.events.emit(ACTIVE_MEMORY_ADAPTER_EVENT, adapters);
+    const adapterContext = {
+      cwd: ctx.cwd,
+      projectId,
+      sessionId: ctx.sessionManager.getSessionId(),
+      extensionContext: ctx,
+    };
+    store = await adapters.createRag(config.providers.rag, adapterContext);
     await store.initialize();
     const migratedProvenance = await store.migrateLegacyProvenance();
     if (migratedProvenance) activity.log("provenance.migrated", { records: migratedProvenance });
     if (thisGeneration !== generation) return;
-    const embeddingKey = config.embedding.provider === "openai" && !process.env[config.embedding.apiKeyEnv ?? "OPENAI_API_KEY"]
-      ? await ctx.modelRegistry.getApiKeyForProvider("openai")
-      : undefined;
-    embedder = new Embedder(config.embedding, embeddingKey);
-    const fast = new PiFastModel(config.fastModel, ctx);
+    embedder = await adapters.createEmbedding(config.providers.embedding, adapterContext);
+    const fast: FastModelRunner = await adapters.createLlm(config.providers.llm, adapterContext);
     engine = new MemoryEngine(config, store, embedder, fast, projectId, ctx.sessionManager.getSessionId(), ctx.cwd, (type, data) => activity?.log(type, data));
     const lifecycle = await engine.sweepLifecycle();
     if (lifecycle.expired) activity.log("lifecycle.sweep", lifecycle);
@@ -133,8 +133,9 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     const prompt = initialRecallPrompt;
     initialRecallPrompt = undefined;
     if (!prompt || paused || !engine || !config?.recall.enabled) return;
-    const context = `${boundedContext(ctx.sessionManager.buildContextEntries(), config.recall.contextCharacters)}\n\nuser: ${prompt}`.slice(-config.recall.contextCharacters);
-    queueRecall(ctx, context);
+    const entries = ctx.sessionManager.buildContextEntries();
+    const context = `${boundedContext(entries, config.recall.contextCharacters)}\n\nuser: ${prompt}`.slice(-config.recall.contextCharacters);
+    queueRecall(ctx, context, contextText(entries));
   });
 
   pi.on("message_update", (event, ctx) => {
@@ -142,9 +143,10 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     thinkingCharacters += event.assistantMessageEvent.delta.length;
     if (thinkingCharacters >= config.recall.thinkingCharacters) {
       thinkingCharacters = 0;
-      const prior = boundedContext(ctx.sessionManager.buildContextEntries(), config.recall.contextCharacters);
+      const entries = ctx.sessionManager.buildContextEntries();
+      const prior = boundedContext(entries, config.recall.contextCharacters);
       const partial = textFromContent(event.assistantMessageEvent.partial.content, true);
-      queueRecall(ctx, `${prior}\n\nassistant partial reasoning/output:\n${partial}`.slice(-config.recall.contextCharacters));
+      queueRecall(ctx, `${prior}\n\nassistant partial reasoning/output:\n${partial}`.slice(-config.recall.contextCharacters), contextText(entries));
     }
   });
 
@@ -152,7 +154,8 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     if (investigation) investigation.toolResults++;
     if (!config || ++toolResults < config.recall.everyToolResults) return;
     toolResults = 0;
-    queueRecall(ctx, boundedContext(ctx.sessionManager.buildContextEntries(), config.recall.contextCharacters));
+    const entries = ctx.sessionManager.buildContextEntries();
+    queueRecall(ctx, boundedContext(entries, config.recall.contextCharacters), contextText(entries));
   });
 
   pi.on("agent_settled", (_event, ctx) => {
@@ -181,7 +184,8 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     turnSequence++;
     if (!config || ++turns < config.recall.everyTurns) return;
     turns = 0;
-    queueRecall(ctx, boundedContext(ctx.sessionManager.buildContextEntries(), config.recall.contextCharacters));
+    const entries = ctx.sessionManager.buildContextEntries();
+    queueRecall(ctx, boundedContext(entries, config.recall.contextCharacters), contextText(entries));
   });
 
   pi.on("session_shutdown", async (event) => {
@@ -219,9 +223,9 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     });
   }
 
-  function queueRecall(ctx: ExtensionContext, context: string): void {
+  function queueRecall(ctx: ExtensionContext, context: string, activeContext: string): void {
     if (paused || !engine || !config?.recall.enabled || !context.trim()) return;
-    recallPending = { ctx, context, generation };
+    recallPending = { ctx, context, activeContext, generation };
     activity?.log("recall.scheduled", { contextCharacters: context.length, coalesced: recallInFlight });
     if (recallInFlight) return;
     void drainRecall();
@@ -242,7 +246,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
         setStatus(job.ctx);
         try {
           const suppressedIds = steerLimiter?.suppressedIds(Date.now(), turnSequence) ?? new Set<string>();
-          const recalled = await engine.recall(job.context, job.ctx.signal, suppressedIds);
+          const recalled = await engine.recall(job.context, job.ctx.signal, suppressedIds, job.activeContext);
           if (!recalled || job.generation !== generation) continue;
           const details = makeDetails(recalled, projectId);
           if (isDuplicateSteer(details, recalled.instruction)) continue;

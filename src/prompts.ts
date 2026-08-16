@@ -5,7 +5,7 @@ export function extractionPrompt(userText: string, context: string, projectId: s
 
 Kinds: user_profile (stable identity/preferences), fact (durable environment/project/tool knowledge), skill_workflow (a reusable workflow the user explains). Scope is global or project (${projectId}).
 
-Never store instructions. Reject commands, requests, acceptance criteria, requested changes/behavior, current-task state, plans, next steps, TODOs, assistant/tool content, guesses, secrets, and transient details. Do not convert an instruction into a preference, convention, fact, or workflow. For example, “I prefer spaces” is knowledge; “use spaces” and “always use pnpm in this repository” are instructions.
+Never store instructions. Reject commands, requests, acceptance criteria, requested changes/behavior, current-task state, plans, next steps, TODOs, temporary tool/package choices, trials such as “let's try it for now”, assistant/tool content, guesses, secrets, and transient details. Do not convert an instruction into a preference, convention, fact, or workflow. For example, “I prefer spaces” is knowledge; “use spaces” and “always use pnpm in this repository” are instructions.
 
 Keep each memory text to one terse, self-contained sentence containing only the durable claim. Return exactly {"memories":[{"text":"terse durable claim","kind":"user_profile|fact|skill_workflow","scope":"global|project","confidence":0.0,"evidence":"exact user quote"}]}, or {"memories":[]}.
 
@@ -17,7 +17,7 @@ ${userText}`;
 }
 
 export function validationPrompt(userText: string, context: string, candidate: { text: string; kind: string; scope: string; evidence: string }): string {
-  return `Validate one memory. Accept only durable user_profile, fact, or skill_workflow knowledge explicitly supported by a faithful USER MESSAGE quote. CONTEXT may resolve references but must not supply the claim itself. Reject every command, request, instruction, acceptance criterion, requested change/behavior, inference, assistant-derived idea, implementation requirement, progress, plan, next step, TODO, or negation error. Never rewrite an imperative instruction as knowledge. Memory text must be one terse, self-contained sentence. Return {"accept":true,"reason":"brief reason"} or {"accept":false,"reason":"brief reason"}.
+  return `Validate one memory. Accept only durable user_profile, fact, or skill_workflow knowledge explicitly supported by a faithful USER MESSAGE quote. CONTEXT may resolve references but must not supply the claim itself. Reject every command, request, instruction, acceptance criterion, requested change/behavior, temporary tool/package choice, trial such as “let's try it for now”, inference, assistant-derived idea, implementation requirement, progress, plan, next step, TODO, or negation error. Never rewrite an imperative instruction as knowledge. Memory text must be one terse, self-contained sentence. Return {"accept":true,"reason":"brief reason"} or {"accept":false,"reason":"brief reason"}.
 
 CONTEXT (reference resolution only):
 ${context}

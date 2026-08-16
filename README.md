@@ -93,43 +93,70 @@ It performs exact cosine search and is suitable for personal memory collections.
 
 ## Configuration
 
-Global configuration:
+Data configuration remains supported:
 
 ```text
 ~/.pi/agent/active-memory.json
-```
-
-Trusted project override:
-
-```text
 .pi/active-memory.json
 ```
 
-Project values are deep-merged over global values. Project configuration is read only when Pi trusts the project.
+Configuration as code is also supported with `.ts`, `.mts`, `.cts`, `.js`, `.mjs`, or `.cjs`:
+
+```text
+~/.pi/agent/active-memory.config.ts
+.pi/active-memory.config.ts
+```
+
+A code module may export an object or a function receiving `{ cwd, projectTrusted, defaults }`:
+
+```ts
+export default ({ cwd }) => ({
+  activityLog: { includeText: !cwd.includes("sensitive") },
+  providers: {
+    llm: {
+      adapter: "pi-model",
+      config: {
+        candidates: ["openai-codex/gpt-5.6-luna"],
+        thinking: "off",
+        maxTokens: 1200,
+      },
+    },
+  },
+});
+```
+
+Precedence is defaults → global JSON → global code → trusted project JSON → trusted project code. Project files, including executable configuration, are read only when Pi trusts the project. Existing `database`, `embedding`, and `fastModel` JSON keys are migrated at load time.
 
 ### Full example
 
 ```json
 {
   "enabled": true,
-  "database": {
-    "provider": "json",
-    "path": "~/.pi/agent/active-memory/vectors.json"
-  },
-  "embedding": {
-    "provider": "openai",
-    "model": "text-embedding-3-small",
-    "baseUrl": "https://api.openai.com/v1",
-    "apiKeyEnv": "OPENAI_API_KEY"
-  },
-  "fastModel": {
-    "candidates": [
-      "openai-codex/gpt-5.6-luna",
-      "openai/gpt-5.6-luna",
-      "openai/gpt-5.4-mini"
-    ],
-    "thinking": "off",
-    "maxTokens": 1200
+  "providers": {
+    "rag": {
+      "adapter": "json",
+      "config": { "path": "~/.pi/agent/active-memory/vectors.json" }
+    },
+    "embedding": {
+      "adapter": "openai",
+      "config": {
+        "model": "text-embedding-3-small",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKeyEnv": "OPENAI_API_KEY"
+      }
+    },
+    "llm": {
+      "adapter": "pi-model",
+      "config": {
+        "candidates": [
+          "openai-codex/gpt-5.6-luna",
+          "openai/gpt-5.6-luna",
+          "openai/gpt-5.4-mini"
+        ],
+        "thinking": "off",
+        "maxTokens": 1200
+      }
+    }
   },
   "capture": {
     "enabled": true,
@@ -203,15 +230,22 @@ Project values are deep-merged over global values. Project configuration is read
 
 ```json
 {
-  "embedding": {
-    "provider": "ollama",
-    "model": "nomic-embed-text",
-    "baseUrl": "http://localhost:11434"
-  },
-  "fastModel": {
-    "candidates": ["ollama/qwen3:4b"],
-    "thinking": "off",
-    "maxTokens": 1200
+  "providers": {
+    "embedding": {
+      "adapter": "ollama",
+      "config": {
+        "model": "nomic-embed-text",
+        "baseUrl": "http://localhost:11434"
+      }
+    },
+    "llm": {
+      "adapter": "pi-model",
+      "config": {
+        "candidates": ["ollama/qwen3:4b"],
+        "thinking": "off",
+        "maxTokens": 1200
+      }
+    }
   }
 }
 ```
@@ -222,11 +256,15 @@ The Ollama chat model must also be configured in Pi's `models.json`.
 
 ```json
 {
-  "embedding": {
-    "provider": "openai-compatible",
-    "model": "BAAI/bge-small-en-v1.5",
-    "baseUrl": "https://embedding.example.com/v1",
-    "apiKeyEnv": "EMBEDDING_API_KEY"
+  "providers": {
+    "embedding": {
+      "adapter": "openai-compatible",
+      "config": {
+        "model": "BAAI/bge-small-en-v1.5",
+        "baseUrl": "https://embedding.example.com/v1",
+        "apiKeyEnv": "EMBEDDING_API_KEY"
+      }
+    }
   }
 }
 ```
@@ -235,16 +273,44 @@ The Ollama chat model must also be configured in Pi's `models.json`.
 
 ```json
 {
-  "database": {
-    "provider": "qdrant",
-    "url": "http://localhost:6333",
-    "collection": "pi-active-memory",
-    "apiKeyEnv": "QDRANT_API_KEY"
+  "providers": {
+    "rag": {
+      "adapter": "qdrant",
+      "config": {
+        "url": "http://localhost:6333",
+        "collection": "pi-active-memory",
+        "apiKeyEnv": "QDRANT_API_KEY"
+      }
+    }
   }
 }
 ```
 
 The collection is created on the first embedding write. Changing embedding dimensions requires a new collection or re-embedding existing memories.
+
+## Third-party adapters
+
+RAG, embedding, and LLM adapters are independent. Another Pi extension can register factories without changing `pi-active-memory`:
+
+```ts
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ActiveMemoryAdapterRegistry } from "pi-active-memory/src/types.js";
+
+export default function (pi: ExtensionAPI) {
+  pi.events.on("pi-active-memory:register-adapters", (value) => {
+    const adapters = value as ActiveMemoryAdapterRegistry;
+    adapters.registerEmbedding("my-embedding", (config) => ({
+      model: `my-embedding/${config.model}`,
+      async embed(texts, signal) {
+        // Call any local or remote embedding service.
+        return embedWithMyProvider(texts, config, signal);
+      },
+    }));
+  });
+}
+```
+
+The registration listener is installed by the adapter extension factory. Active Memory emits discovery during `session_start`, after all extension factories have loaded. Select it with `providers.embedding.adapter: "my-embedding"`. The same registry exposes `registerRag` and `registerLlm`. Adapter configuration is passed through untouched.
 
 ## Memory eligibility
 
@@ -328,9 +394,11 @@ Forgetting is unified with confidence. On the first lifecycle sweep of each UTC 
 
 Useful feedback raises confidence and reduces `decayRate`, making repeatedly useful memories decay progressively more slowly; judged relevant recall resets the daily clock without adding confidence or changing decay rate. Unhelpful feedback only lowers confidence—it does not increase decay rate or renew the daily clock. Records below the configured deletion threshold are soft-deleted with `deletedAt` and `deletionCause: low_confidence`. Legacy records receive a fresh daily-decay clock on migration, preventing retroactive decay across their full historical age.
 
-## Recent-memory suppression
+## Live-context and recent-memory suppression
 
-By default, a memory created in the current Pi session is not eligible for retrieval until it is 30 minutes old. The originating user message should still be available in the live context, so recalling it immediately would be redundant and could create feedback loops.
+A memory is never eligible for recall while its stored source user text or evidence still appears in Pi's active context after compaction processing. This suppression follows the actual active context rather than relying only on session IDs, so it also works across resumed/forked session files and stops once compaction removes the source passage.
+
+As an additional guard, a memory created in the current Pi session is not eligible for retrieval until it is 30 minutes old by default. The originating user message should still be available in the live context, so recalling it immediately would be redundant and could create feedback loops.
 
 Configure the window with `recall.minimumMemoryAgeMinutes`; set it to `0` to disable suppression. The filter applies only when both conditions hold:
 
@@ -349,10 +417,11 @@ Pi delivers a steer after the current assistant response and its current tool ba
 
 - Memories and vectors may contain sensitive project knowledge. The JSON store is created with mode `0600`.
 - Secret redaction is defense-in-depth, not a guarantee. Use `/memory-pause` for sensitive work.
-- External fast/embedding providers receive bounded conversation context.
+- External LLM/embedding providers receive bounded conversation context.
 - Retrieved memory is labelled as untrusted historical context before the relevance model judges it.
 - Project configuration is ignored until the project is trusted.
-- Fast-model side calls and OpenAI embedding calls may consume quota or incur API charges.
+- Configuration-as-code and adapter extensions execute with the user's permissions; install only trusted code.
+- LLM side calls prefer the configured `openai-codex` subscription model. Fallback LLMs and OpenAI embedding calls may consume quota or incur API charges.
 
 ## Development
 

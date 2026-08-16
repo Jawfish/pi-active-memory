@@ -1,12 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { ActivitySink } from "./activity-log.js";
 import { pairSimilarMemories, type CompactionProposal, type MemoryCluster } from "./compaction.js";
-import type { ActiveMemoryConfig, FastModelRunner, MemoryActor, MemoryKind, MemoryMatch, MemoryRecord, MemoryScope, MemorySource, VectorStore } from "./types.js";
-import { Embedder } from "./embeddings.js";
+import type { ActiveMemoryConfig, EmbeddingProvider, FastModelRunner, MemoryActor, MemoryKind, MemoryMatch, MemoryRecord, MemoryScope, MemorySource, VectorStore } from "./types.js";
 import { applyConfidenceFeedback, type FeedbackOutcome } from "./feedback.js";
 import { advanceMemoryLifecycle, initializeMemoryLifecycle, reinforceMemoryLifecycle } from "./lifecycle.js";
 import { assistantExtractionPrompt, assistantValidationPrompt, compactionPrompt, compactionValidationPrompt, extractionPrompt, JSON_ONLY, judgePrompt, mergePrompt, queryPrompt, validationPrompt } from "./prompts.js";
-import { evidenceAppearsInUserMessage, redactSecrets } from "./utils.js";
+import { evidenceAppearsInUserMessage, isTransientTaskMemory, redactSecrets, sourceEvidenceAppearsInContext } from "./utils.js";
 
 interface Extracted { text: string; kind: MemoryKind; scope: MemoryScope; confidence: number; evidence: string }
 interface AssistantExtracted extends Extracted { whyStored: string }
@@ -18,7 +17,7 @@ export class MemoryEngine {
   constructor(
     private readonly config: ActiveMemoryConfig,
     private readonly store: VectorStore,
-    private readonly embedder: Embedder,
+    private readonly embedder: EmbeddingProvider,
     private readonly fast: FastModelRunner,
     private readonly projectId: string,
     private readonly sessionId: string,
@@ -37,9 +36,9 @@ export class MemoryEngine {
     });
     let stored = 0;
     for (const raw of result.memories ?? []) {
-      if (!validUserExtracted(raw) || !evidenceAppearsInUserMessage(raw.evidence, userText) || raw.confidence < this.config.capture.confidenceThreshold) {
+      if (!validUserExtracted(raw) || !evidenceAppearsInUserMessage(raw.evidence, userText) || isTransientTaskMemory(raw.text, raw.evidence) || raw.confidence < this.config.capture.confidenceThreshold) {
         this.activity?.("capture.rejected", {
-          reason: !validUserExtracted(raw) ? "invalid_schema_or_kind" : !evidenceAppearsInUserMessage(raw.evidence, userText) ? "evidence_not_in_user_message" : "low_confidence",
+          reason: !validUserExtracted(raw) ? "invalid_schema_or_kind" : !evidenceAppearsInUserMessage(raw.evidence, userText) ? "evidence_not_in_user_message" : isTransientTaskMemory(raw.text, raw.evidence) ? "transient_task_intent" : "low_confidence",
           ...(this.config.activityLog.includeText ? { candidate: raw } : {}),
         });
         continue;
@@ -275,7 +274,7 @@ export class MemoryEngine {
     return compacted;
   }
 
-  async recall(context: string, signal?: AbortSignal, excludedIds: ReadonlySet<string> = new Set()): Promise<RecallResult | undefined> {
+  async recall(context: string, signal?: AbortSignal, excludedIds: ReadonlySet<string> = new Set(), activeContext = context): Promise<RecallResult | undefined> {
     if (!this.config.recall.enabled || !context.trim()) return undefined;
     this.activity?.("recall.started", { contextCharacters: context.length });
     const query = await this.fast.json<{ query?: string }>(JSON_ONLY, queryPrompt(context), signal);
@@ -287,7 +286,9 @@ export class MemoryEngine {
     const searched = await this.store.search(vector, { status: "active", scopes: ["global", "project"], kinds: ["user_profile", "fact", "skill_workflow"], projectId: this.projectId }, searchLimit);
     const frequencySuppressed = searched.filter((match) => excludedIds.has(match.record.id));
     if (frequencySuppressed.length) this.activity?.("recall.frequency_filtered", { ids: frequencySuppressed.map((match) => match.record.id) });
-    const raw = searched.filter((match) => !excludedIds.has(match.record.id) && match.score >= this.config.recall.minVectorScore);
+    const contextSuppressed = searched.filter((match) => sourceEvidenceAppearsInContext(match.record, activeContext));
+    if (contextSuppressed.length) this.activity?.("recall.source_context_filtered", { ids: contextSuppressed.map((match) => match.record.id) });
+    const raw = searched.filter((match) => !excludedIds.has(match.record.id) && !sourceEvidenceAppearsInContext(match.record, activeContext) && match.score >= this.config.recall.minVectorScore);
     const scored = rankMemoryMatches(raw);
     const minimumAgeMs = Math.max(0, this.config.recall.minimumMemoryAgeMinutes) * 60_000;
     const now = Date.now();
