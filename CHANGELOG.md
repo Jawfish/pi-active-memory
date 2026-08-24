@@ -1,3 +1,5 @@
+## [1.7.0](https://github.com/Rizhiy/pi-active-memory/compare/v1.6.0...v1.7.0) (2026-08-24)
+
 ## [1.6.0](https://github.com/Rizhiy/pi-active-memory/compare/v1.5.0...v1.6.0) (2026-08-24)
 
 ## [1.5.0](https://github.com/Rizhiy/pi-active-memory/compare/v1.4.0...v1.5.0) (2026-08-22)
