@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { getSettingsListTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, getSettingsListTheme, type ExtensionAPI, type ExtensionContext, UserMessageComponent } from "@earendil-works/pi-coding-agent";
 import { Container, fuzzyFilter, Input, SettingsList, Text, truncateToWidth, type Focusable, type SettingItem } from "@earendil-works/pi-tui";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -76,7 +76,8 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       text += `\n${theme.fg("dim", `memories: ${details.memoryIds.join(", ")}`)}`;
       if (details.reason) text += `\n${theme.fg("dim", `reason: ${details.reason}`)}`;
     }
-    return new Text(text, 0, 0);
+    const outputPad = (options as { outputPad?: number }).outputPad ?? 1;
+    return new UserMessageComponent(text, getMarkdownTheme(), outputPad);
   });
 
   pi.on("session_start", async (_event, ctx) => {
