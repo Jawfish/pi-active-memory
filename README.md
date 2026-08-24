@@ -360,9 +360,9 @@ Replaces an exact assistant-generated memory after the agent independently estab
 
 Rates one exact memory from one exact steer as `useful` or `unhelpful`, with a concrete reason. Each steer includes both its feedback token and the exact eligible memory IDs. Irrelevant steered memories should receive `unhelpful`; relevant but redundant memories receive no feedback; memories that change the planned work receive `useful`. The tool requires the unguessable token included in that steer, accepts each token/memory pair once, and caps feedback per memory per session. Useful feedback raises confidence and renews lifecycle budgets; unhelpful feedback lowers confidence without renewing it. Full feedback provenance is retained in bounded history. The one-line steer display adds a green `🟢` for useful feedback or red `🔴` for unhelpful feedback beside the steer.
 
-## Memory editor and fuzzy finder
+## Memory editor and semantic finder
 
-Run `/memory` to search interactively across memory text, ID, scope, kind, status, and project metadata. Select a result and choose **Edit** or **Delete**. `/memory-edit` opens the same finder directly in edit mode, while `/memory-forget` opens it directly in delete mode.
+Run `/memory` to search memories semantically using the configured embedding and vector-store providers. Search begins after the query remains unchanged for 500 ms; an empty query lists memories by recency. Select a result and choose **Edit** or **Delete**. `/memory-edit` opens the same finder directly in edit mode, while `/memory-forget` opens it directly in delete mode.
 
 The editor exposes JSON fields for `text`, `kind`, `scope`, `projectId`, `confidence`, `priority`, and `status`. It validates changes and regenerates the semantic-search embedding before saving. IDs, creation times, and provenance remain immutable. Deletion is soft and requires confirmation.
 
@@ -372,10 +372,10 @@ The editor exposes JSON fields for `text`, `kind`, `scope`, `projectId`, `confid
 | -------------------------------- | -------------------------------------------------------------------- |
 | `/memory-status`                 | Provider/store health, counters, latest error and latest recall      |
 | `/memory-stats`                  | Current-session creates, recall attempts, steers, and feedback counts |
-| `/memory`                        | Fuzzy-find a memory, then edit or delete it                          |
-| `/memory-edit`                   | Fuzzy-find and edit a memory's text or metadata                      |
-| `/memory-list [global\|project]` | Inspect active memories and their IDs                                |
-| `/memory-forget [id-or-prefix]`  | User-only fuzzy-find and soft-delete, or delete by a unique ID prefix |
+| `/memory`                        | Semantically find a memory, then edit or delete it                    |
+| `/memory-edit`                   | Semantically find and edit a memory's text or metadata                |
+| `/memory-list [global\|project]` | Inspect active memories and their IDs                                 |
+| `/memory-forget [id-or-prefix]`  | Semantically find and soft-delete, or delete by a unique ID prefix    |
 | `/memory-compact`                | Review related pairs and combine selected memories                   |
 | `/memory-settings`               | Configure extension settings, including compaction similarity        |
 | `/memory-why`                    | Show IDs, scores, feedback token, and latest steer reason            |

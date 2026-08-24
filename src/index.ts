@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getMarkdownTheme, getSettingsListTheme, type ExtensionAPI, type ExtensionContext, UserMessageComponent } from "@earendil-works/pi-coding-agent";
-import { Container, fuzzyFilter, Input, SettingsList, Text, truncateToWidth, type Focusable, type SettingItem } from "@earendil-works/pi-tui";
+import { Container, Input, SettingsList, Text, truncateToWidth, type Focusable, type SettingItem } from "@earendil-works/pi-tui";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { ActivityLogger } from "./activity-log.js";
@@ -350,18 +350,70 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       const input = new Input();
       let selected = 0;
       let matches = rows;
+      let scores = new Map<string, number>();
+      let searching = false;
+      let searchError: string | undefined;
+      let searchGeneration = 0;
+      let searchTimer: ReturnType<typeof setTimeout> | undefined;
+      let searchController: AbortController | undefined;
       let cachedWidth: number | undefined;
       let cachedLines: string[] | undefined;
 
-      const refresh = (resetSelection = false) => {
-        matches = fuzzyFilter(rows, input.getValue(), (record) =>
-          `${record.text} ${record.kind} ${record.scope} ${record.projectId ?? ""} ${record.status} ${record.source.actor ?? "user"} ${record.source.cause ?? ""} ${record.source.reason ?? ""} ${record.id}`,
-        );
-        if (resetSelection) selected = 0;
+      const redraw = () => {
         selected = Math.max(0, Math.min(selected, matches.length - 1));
         cachedWidth = undefined;
         cachedLines = undefined;
         tui.requestRender();
+      };
+      const finish = (record?: MemoryRecord) => {
+        searchGeneration++;
+        if (searchTimer) clearTimeout(searchTimer);
+        searchController?.abort();
+        done(record);
+      };
+      const scheduleSearch = () => {
+        const query = input.getValue().trim();
+        const generation = ++searchGeneration;
+        if (searchTimer) clearTimeout(searchTimer);
+        searchController?.abort();
+        searchController = undefined;
+        searchError = undefined;
+        selected = 0;
+        if (!query) {
+          searching = false;
+          matches = rows;
+          scores = new Map();
+          redraw();
+          return;
+        }
+        searching = true;
+        redraw();
+        searchTimer = setTimeout(() => {
+          const controller = new AbortController();
+          searchController = controller;
+          void (async () => {
+            const [vector] = await embedder!.embed([query], controller.signal);
+            if (!vector) throw new Error("Embedding failed");
+            const found = await store!.search(vector, {
+              scopes: ["global", "project"],
+              kinds: SUPPORTED_MEMORY_KINDS,
+              projectId,
+            }, 10000);
+            if (generation !== searchGeneration) return;
+            const visible = found.filter((match) => match.record.status !== "deleted");
+            matches = visible.map((match) => match.record);
+            scores = new Map(visible.map((match) => [match.record.id, match.score]));
+            searching = false;
+            redraw();
+          })().catch((error) => {
+            if (controller.signal.aborted || generation !== searchGeneration) return;
+            searching = false;
+            matches = [];
+            scores = new Map();
+            searchError = error instanceof Error ? error.message : String(error);
+            redraw();
+          });
+        }, 500);
       };
 
       const component: Focusable & {
@@ -378,7 +430,11 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           const inputWidth = Math.max(1, w - 3);
           lines.push(truncateToWidth(`${theme.fg("muted", "> ")}${input.render(inputWidth)[0] ?? ""}`, w));
           lines.push("");
-          if (!matches.length) {
+          if (searching) {
+            lines.push(truncateToWidth(theme.fg("dim", "  Searching semantically…"), w));
+          } else if (searchError) {
+            lines.push(truncateToWidth(theme.fg("error", `  Semantic search failed: ${searchError}`), w));
+          } else if (!matches.length) {
             lines.push(truncateToWidth(theme.fg("warning", "  No matching memories"), w));
           } else {
             const pageSize = 10;
@@ -386,31 +442,33 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
             for (let index = start; index < Math.min(matches.length, start + pageSize); index++) {
               const record = matches[index]!;
               const prefix = index === selected ? theme.fg("accent", "> ") : "  ";
-              const metadata = theme.fg("muted", `[${record.scope}/${record.kind}/${record.source.actor ?? "user"}/c=${record.confidence.toFixed(2)}]`);
+              const score = scores.get(record.id);
+              const scoreText = score === undefined ? "" : `/s=${score.toFixed(2)}`;
+              const metadata = theme.fg("muted", `[${record.scope}/${record.kind}/${record.source.actor ?? "user"}/c=${record.confidence.toFixed(2)}${scoreText}]`);
               lines.push(truncateToWidth(`${prefix}${metadata} ${record.text}`, w));
             }
             lines.push("");
             lines.push(truncateToWidth(theme.fg("dim", `${selected + 1}/${matches.length} • id ${matches[selected]!.id}`), w));
           }
-          lines.push(truncateToWidth(theme.fg("dim", "Type to fuzzy-search • ↑↓ navigate • Enter select • Esc cancel"), w));
+          lines.push(truncateToWidth(theme.fg("dim", "Type to semantic-search • ↑↓ navigate • Enter select • Esc cancel"), w));
           lines.push(theme.fg("accent", "─".repeat(w)));
           cachedWidth = width;
           cachedLines = lines;
           return lines;
         },
         handleInput(data: string) {
-          if (keybindings.matches(data, "tui.select.cancel")) return done(undefined);
-          if (keybindings.matches(data, "tui.select.up")) { selected = Math.max(0, selected - 1); return refresh(); }
-          if (keybindings.matches(data, "tui.select.down")) { selected = Math.min(matches.length - 1, selected + 1); return refresh(); }
-          if (keybindings.matches(data, "tui.select.pageUp")) { selected = Math.max(0, selected - 10); return refresh(); }
-          if (keybindings.matches(data, "tui.select.pageDown")) { selected = Math.min(matches.length - 1, selected + 10); return refresh(); }
+          if (keybindings.matches(data, "tui.select.cancel")) return finish();
+          if (keybindings.matches(data, "tui.select.up")) { selected = Math.max(0, selected - 1); return redraw(); }
+          if (keybindings.matches(data, "tui.select.down")) { selected = Math.min(matches.length - 1, selected + 1); return redraw(); }
+          if (keybindings.matches(data, "tui.select.pageUp")) { selected = Math.max(0, selected - 10); return redraw(); }
+          if (keybindings.matches(data, "tui.select.pageDown")) { selected = Math.min(matches.length - 1, selected + 10); return redraw(); }
           if (keybindings.matches(data, "tui.select.confirm")) {
-            if (matches[selected]) done(matches[selected]);
+            if (!searching && matches[selected]) finish(matches[selected]);
             return;
           }
           const before = input.getValue();
           input.handleInput(data);
-          refresh(input.getValue() !== before);
+          if (input.getValue() !== before) scheduleSearch();
         },
         invalidate() { input.invalidate(); cachedWidth = undefined; cachedLines = undefined; },
       };
@@ -573,7 +631,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     },
   });
   pi.registerCommand("memory", {
-    description: "Fuzzy-find a memory, then edit or delete it",
+    description: "Semantically find a memory, then edit or delete it",
     handler: async (_args, ctx) => {
       if (!store) return ctx.ui.notify("Memory store is not initialized", "warning");
       await captureQueue.drain().catch(() => {});
@@ -585,7 +643,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     },
   });
   pi.registerCommand("memory-edit", {
-    description: "Fuzzy-find and edit a memory, including its metadata",
+    description: "Semantically find and edit a memory, including its metadata",
     handler: async (_args, ctx) => {
       if (!store) return ctx.ui.notify("Memory store is not initialized", "warning");
       await captureQueue.drain().catch(() => {});
@@ -594,7 +652,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     },
   });
   pi.registerCommand("memory-forget", {
-    description: "Fuzzy-find and soft-delete a memory; an exact ID or unique prefix is optional",
+    description: "Semantically find and soft-delete a memory; an exact ID or unique prefix is optional",
     handler: async (args, ctx) => {
       if (!store) return ctx.ui.notify("Memory store is not initialized", "warning");
       await captureQueue.drain().catch(() => {});
