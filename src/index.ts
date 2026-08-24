@@ -14,6 +14,7 @@ import { SteerFeedbackLedger } from "./feedback.js";
 import { ActiveMemoryFooterStatus } from "./footer-status.js";
 import { MemoryEngine, rankMemoryMatches } from "./memory-engine.js";
 import { renderPrompt, steerFeedbackPrompt } from "./prompts.js";
+import { emptySessionStats, formatSessionStats, SESSION_STATS_ENTRY_TYPE, sessionStatsFromEntries, type SessionStatName } from "./session-stats.js";
 import { activeMemoryStatus, compactionProgressStatus } from "./status.js";
 import { formatSteerSentence, orderedFeedbackOutcomes, type SteerFeedbackOutcome } from "./steer-display.js";
 import { MemorySteerLimiter } from "./steer-frequency.js";
@@ -46,6 +47,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   let lastRecall: SteerDetails | undefined;
   let lastError: string | undefined;
   let capturedCount = 0;
+  let sessionStats = emptySessionStats();
   let investigation: Investigation | undefined;
   const dailySweepGate = new DailySweepGate();
   const footerStatus = new ActiveMemoryFooterStatus();
@@ -60,6 +62,11 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     } else {
       ctx.ui.setStatus("active-memory", status);
     }
+  };
+
+  const incrementSessionStat = (name: SessionStatName): void => {
+    sessionStats[name]++;
+    pi.appendEntry(SESSION_STATS_ENTRY_TYPE, { name, amount: 1 });
   };
 
   pi.registerMessageRenderer<SteerDetails>("active-memory-steer", (message, options, theme) => {
@@ -89,7 +96,9 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     steerLimiter = new MemorySteerLimiter(config.recall);
     feedbackLedger = new SteerFeedbackLedger();
     feedbackBySteer.clear();
-    for (const entry of ctx.sessionManager.getBranch()) {
+    const branch = ctx.sessionManager.getBranch();
+    sessionStats = sessionStatsFromEntries(branch);
+    for (const entry of branch) {
       const message = entry.type === "message" ? entry.message : undefined;
       if (message?.role !== "toolResult" || message.toolName !== "memory_feedback") continue;
       const details = message.details as { accepted?: boolean; steerToken?: string; memoryId?: string; outcome?: SteerFeedbackOutcome } | undefined;
@@ -120,7 +129,12 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     if (thisGeneration !== generation) return;
     embedder = await adapters.createEmbedding(config.providers.embedding, adapterContext);
     const fast: FastModelRunner = await adapters.createLlm(config.providers.llm, adapterContext);
-    engine = new MemoryEngine(config, store, embedder, fast, projectId, ctx.sessionManager.getSessionId(), ctx.cwd, (type, data) => activity?.log(type, data));
+    engine = new MemoryEngine(config, store, embedder, fast, projectId, ctx.sessionManager.getSessionId(), ctx.cwd, (type, data) => {
+      activity?.log(type, data);
+      if (type === "capture.stored" && typeof data === "object" && data !== null && (data as { created?: unknown }).created === true) {
+        incrementSessionStat("memoriesCreated");
+      }
+    });
     const lifecycle = await engine.sweepLifecycle();
     if (lifecycle.expired) activity.log("lifecycle.sweep", lifecycle);
     dailySweepTimer = setInterval(() => queueDailySweep(ctx), DAILY_SWEEP_POLL_INTERVAL_MS);
@@ -273,6 +287,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
         setStatus(job.ctx);
         try {
           const suppressedIds = steerLimiter?.suppressedIds(Date.now(), turnSequence) ?? new Set<string>();
+          incrementSessionStat("recallAttempts");
           const recalled = await engine.recall(job.context, job.ctx.signal, suppressedIds, job.activeContext);
           if (!recalled || job.generation !== generation) continue;
           const details = makeDetails(recalled, projectId);
@@ -283,6 +298,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           const delivery = job.ctx.isIdle() ? "nextTurn" : "steer";
           const feedbackHint = `\n\n${steerFeedbackPrompt(config.prompts.steerFeedback, details.feedbackToken, details.memoryIds)}`;
           pi.sendMessage({ customType: "active-memory-steer", content: `${recalled.instruction}${feedbackHint}`, display: true, details }, { deliverAs: delivery, triggerTurn: false });
+          incrementSessionStat("memorySteers");
           activity?.log("steer.queued", { delivery, ...details, ...(config.activityLog.includeText ? { instruction: recalled.instruction } : {}) });
           lastError = undefined;
         } catch (error) {
@@ -475,7 +491,14 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     description: "Show active-memory health and configuration",
     handler: async (_args, ctx) => {
       const count = store ? (await store.list({ status: "active", kinds: SUPPORTED_MEMORY_KINDS }, 100000)).length : 0;
-      ctx.ui.notify(JSON.stringify({ state: paused ? "paused" : "active", projectId, memories: count, capturedThisSession: capturedCount, recallInFlight, activityLog: activity?.path, lastRecall, lastError, config: config && publicConfig(config) }, null, 2), lastError ? "warning" : "info");
+      ctx.ui.notify(JSON.stringify({ state: paused ? "paused" : "active", projectId, memories: count, capturedThisSession: capturedCount, sessionStats, recallInFlight, activityLog: activity?.path, lastRecall, lastError, config: config && publicConfig(config) }, null, 2), lastError ? "warning" : "info");
+    },
+  });
+  pi.registerCommand("memory-stats", {
+    description: "Show active-memory counters for the current session",
+    handler: async (_args, ctx) => {
+      await captureQueue.drain().catch(() => {});
+      ctx.ui.notify(formatSessionStats(sessionStats), "info");
     },
   });
   pi.registerCommand("memory-settings", {
@@ -725,6 +748,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text", text: `Memory ${params.memoryId} is no longer active` }], details: { accepted: false, reason: "inactive", steerToken: params.steerToken, memoryId: params.memoryId, outcome: params.outcome, confidence: 0, status: "inactive" } };
         }
         recordDisplayedFeedback(params.steerToken, updated.id, params.outcome);
+        incrementSessionStat(params.outcome === "useful" ? "useful" : "unhelpful");
         const lifecycleResult = updated.status === "deleted" ? ` and the memory was soft-deleted (${updated.lifecycle?.deletionCause ?? "expired"})` : "";
         return { content: [{ type: "text", text: `Recorded ${params.outcome} feedback for ${params.memoryId}; confidence is now ${updated.confidence.toFixed(2)}${lifecycleResult}` }], details: { accepted: true, reason: params.reason, steerToken: params.steerToken, memoryId: updated.id, outcome: params.outcome, confidence: updated.confidence, status: updated.status } };
       } catch (error) {

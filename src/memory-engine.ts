@@ -440,7 +440,7 @@ export class MemoryEngine {
       ? initializeMemoryLifecycle(baseRecord, new Date(now), this.sessionId, this.config.memoryLifecycle)
       : baseRecord;
     await this.store.upsert(record, canonicalVector);
-    this.activity?.("capture.stored", this.memoryActivity(record));
+    this.activity?.("capture.stored", { ...this.memoryActivity(record), created: !replacing });
     return true;
   }
 

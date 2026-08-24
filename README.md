@@ -371,6 +371,7 @@ The editor exposes JSON fields for `text`, `kind`, `scope`, `projectId`, `confid
 | Command                          | Purpose                                                              |
 | -------------------------------- | -------------------------------------------------------------------- |
 | `/memory-status`                 | Provider/store health, counters, latest error and latest recall      |
+| `/memory-stats`                  | Current-session creates, recall attempts, steers, and feedback counts |
 | `/memory`                        | Fuzzy-find a memory, then edit or delete it                          |
 | `/memory-edit`                   | Fuzzy-find and edit a memory's text or metadata                      |
 | `/memory-list [global\|project]` | Inspect active memories and their IDs                                |
