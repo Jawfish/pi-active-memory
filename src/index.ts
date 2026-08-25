@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { getMarkdownTheme, getSettingsListTheme, type ExtensionAPI, type ExtensionContext, UserMessageComponent } from "@earendil-works/pi-coding-agent";
-import { Container, Input, SettingsList, Text, truncateToWidth, type Focusable, type SettingItem } from "@earendil-works/pi-tui";
+import { getSettingsListTheme, ToolExecutionComponent, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Container, Input, SettingsList, Text, truncateToWidth, type Focusable, type SettingItem, type TUI } from "@earendil-works/pi-tui";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { ActivityLogger } from "./activity-log.js";
@@ -24,6 +24,9 @@ import { boundedAssistantInvestigation, boundedContext, contextText, redactSecre
 interface SteerDetails { memoryIds: string[]; scores: number[]; reason: string; instruction?: string; projectId: string; feedbackToken: string; source: "active-memory" }
 interface Investigation { startedAt: number; cause: string; toolResults: number; startEntryCount?: number }
 const SUPPORTED_MEMORY_KINDS: MemoryKind[] = ["user_profile", "fact", "skill_workflow"];
+const STEER_TOOL_NAME = "memory_steer";
+const STEER_TOOL_PARAMETERS = Type.Object({ text: Type.String() });
+const NOOP_TUI = { requestRender() {} } as unknown as TUI;
 
 export default function activeMemoryExtension(pi: ExtensionAPI) {
   let generation = 0;
@@ -52,6 +55,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   const dailySweepGate = new DailySweepGate();
   const footerStatus = new ActiveMemoryFooterStatus();
   let dailySweepTimer: ReturnType<typeof setInterval> | undefined;
+  let currentCwd = process.cwd();
 
   const setStatus = (ctx: ExtensionContext) => {
     if (!ctx.hasUI) return;
@@ -83,11 +87,36 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       text += `\n${theme.fg("dim", `memories: ${details.memoryIds.join(", ")}`)}`;
       if (details.reason) text += `\n${theme.fg("dim", `reason: ${details.reason}`)}`;
     }
-    const outputPad = (options as { outputPad?: number }).outputPad ?? 1;
-    return new UserMessageComponent(text, getMarkdownTheme(), outputPad);
+
+    const toolDefinition: ToolDefinition<typeof STEER_TOOL_PARAMETERS, SteerDetails | undefined> = {
+      name: STEER_TOOL_NAME,
+      label: "Memory Steer",
+      description: "Display a proactive memory recall in the transcript.",
+      parameters: STEER_TOOL_PARAMETERS,
+      renderShell: "self",
+      async execute() {
+        return { content: [{ type: "text", text: steer }], details };
+      },
+      renderCall() {
+        return new Text(text, 0, 0);
+      },
+    };
+    const component = new ToolExecutionComponent(
+      STEER_TOOL_NAME,
+      `active-memory-steer:${details?.feedbackToken ?? message.timestamp}`,
+      { text: steer },
+      { showImages: false },
+      toolDefinition,
+      NOOP_TUI,
+      currentCwd,
+    );
+    component.updateResult({ content: [], details, isError: false });
+    component.setExpanded(options.expanded);
+    return component;
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    currentCwd = ctx.cwd;
     if (ctx.mode === "tui") footerStatus.install();
     const thisGeneration = ++generation;
     paused = false; turns = 0; turnSequence = 0; toolResults = 0; thinkingCharacters = 0; lastError = undefined; investigation = undefined; initialRecallPrompt = undefined;
