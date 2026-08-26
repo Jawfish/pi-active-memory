@@ -86,6 +86,28 @@ test("legacy provider configuration migrates to independent adapter selections",
   }
 });
 
+test("separate embedding models replace the default unified model", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "active-memory-separate-embedding-"));
+  const cwd = join(directory, "project");
+  const agentDir = join(directory, "agent");
+  try {
+    await mkdir(cwd, { recursive: true });
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(join(agentDir, "active-memory.json"), JSON.stringify({
+      providers: { embedding: { config: { queryModel: "query-model", documentModel: "document-model" } } },
+    }));
+    const config = await loadConfig(cwd, false, agentDir);
+    assert.deepEqual(config.providers.embedding.config, {
+      queryModel: "query-model",
+      documentModel: "document-model",
+      baseUrl: "https://api.openai.com/v1",
+      apiKeyEnv: "OPENAI_API_KEY",
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("trusted TypeScript configuration as code overlays JSON configuration", async () => {
   const directory = await mkdtemp(join(tmpdir(), "active-memory-code-config-"));
   const cwd = join(directory, "project");

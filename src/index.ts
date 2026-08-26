@@ -1,15 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { getSettingsListTheme, ToolExecutionComponent, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
+import { getAgentDir, getSettingsListTheme, ToolExecutionComponent, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Container, Input, SettingsList, Text, truncateToWidth, type Focusable, type SettingItem, type TUI } from "@earendil-works/pi-tui";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { ActivityLogger } from "./activity-log.js";
-import { ACTIVE_MEMORY_ADAPTER_EVENT, createBuiltInAdapterRegistry } from "./adapters.js";
+import { ACTIVE_MEMORY_ADAPTER_EVENT, configuredEmbeddingModels, createBuiltInAdapterRegistry } from "./adapters.js";
 import { DeferredSerialQueue } from "./background-queue.js";
 import type { CompactionProposal } from "./compaction.js";
 import { DAILY_SWEEP_POLL_INTERVAL_MS, DailySweepGate } from "./daily-sweep.js";
 import { reviewCompactionPair } from "./compaction-review.js";
 import { DEFAULT_CONFIG, loadConfig, publicConfig, saveUserCompactionThreshold, saveUserMemoryLifecycle } from "./config.js";
+import { embeddingStoreKey, readEmbeddingModels, writeEmbeddingModels } from "./embedding-metadata.js";
+import { embedDocuments, embeddingModels, embedQuery } from "./embeddings.js";
 import { SteerFeedbackLedger } from "./feedback.js";
 import { ActiveMemoryFooterStatus } from "./footer-status.js";
 import { MemoryEngine, rankMemoryMatches } from "./memory-engine.js";
@@ -18,7 +21,7 @@ import { emptySessionStats, formatSessionStats, SESSION_STATS_ENTRY_TYPE, sessio
 import { activeMemoryStatus, compactionProgressStatus } from "./status.js";
 import { formatSteerSentence, orderedFeedbackOutcomes, type SteerFeedbackOutcome } from "./steer-display.js";
 import { MemorySteerLimiter } from "./steer-frequency.js";
-import type { ActiveMemoryConfig, EmbeddingProvider, FastModelRunner, MemoryKind, MemoryRecord, MemoryScope, VectorStore } from "./types.js";
+import type { ActiveMemoryConfig, EmbeddingModels, EmbeddingProvider, FastModelRunner, MemoryKind, MemoryRecord, MemoryScope, VectorStore } from "./types.js";
 import { boundedAssistantInvestigation, boundedContext, contextText, redactSecrets, stableProjectId, textFromContent } from "./utils.js";
 
 interface SteerDetails { memoryIds: string[]; scores: number[]; reason: string; instruction?: string; projectId: string; feedbackToken: string; source: "active-memory" }
@@ -27,6 +30,71 @@ const SUPPORTED_MEMORY_KINDS: MemoryKind[] = ["user_profile", "fact", "skill_wor
 const STEER_TOOL_NAME = "memory_steer";
 const STEER_TOOL_PARAMETERS = Type.Object({ text: Type.String() });
 const NOOP_TUI = { requestRender() {} } as unknown as TUI;
+const BUILT_IN_EMBEDDING_ADAPTERS = new Set(["openai", "openai-compatible", "ollama"]);
+const EMBEDDING_BATCH_SIZE = 64;
+
+async function ensureEmbeddingCompatibility(
+  ctx: ExtensionContext,
+  store: VectorStore,
+  embedder: EmbeddingProvider,
+  rag: ActiveMemoryConfig["providers"]["rag"],
+): Promise<boolean> {
+  const current = embeddingModels(embedder);
+  const metadataPath = join(getAgentDir(), "active-memory", "embedding-models.json");
+  const key = embeddingStoreKey(rag);
+  let stored = await readEmbeddingModels(metadataPath, key);
+  const records = await (store.listAll?.() ?? store.list({}, 100000));
+
+  if (!stored) {
+    const legacyModels = [...new Set(records.map((record) => record.embeddingModel).filter(Boolean))];
+    if (legacyModels.length === 0) {
+      await writeEmbeddingModels(metadataPath, key, current);
+      return true;
+    }
+    const legacy = legacyModels.length === 1 ? legacyModels[0]! : `mixed:${legacyModels.join(",")}`;
+    stored = { query: legacy, document: legacy };
+    if (sameEmbeddingModels(stored, current)) {
+      await writeEmbeddingModels(metadataPath, key, current);
+      return true;
+    }
+  }
+
+  if (sameEmbeddingModels(stored, current)) return true;
+  const change = `query ${stored.query} → ${current.query}; document ${stored.document} → ${current.document}`;
+  ctx.ui.notify(`Active Memory embedding models changed: ${change}`, "warning");
+  if (!ctx.hasUI || !await ctx.ui.confirm("Re-embed Active Memory?", `${change}\n\nRe-embed all memories now? Declining deactivates the plugin for this session.`)) {
+    ctx.ui.notify("Active Memory deactivated because stored vectors use different embedding models", "error");
+    return false;
+  }
+
+  ctx.ui.setWorkingMessage("Re-embedding memories…");
+  try {
+    const rows: Array<{ record: MemoryRecord; vector: number[] }> = [];
+    for (let offset = 0; offset < records.length; offset += EMBEDDING_BATCH_SIZE) {
+      const batch = records.slice(offset, offset + EMBEDDING_BATCH_SIZE);
+      const vectors = await embedDocuments(embedder, batch.map((record) => record.text));
+      if (vectors.length !== batch.length) throw new Error("Embedding provider returned an unexpected number of vectors");
+      rows.push(...batch.map((record, index) => ({
+        record: { ...record, embeddingModel: current.document },
+        vector: vectors[index]!,
+      })));
+    }
+    if (store.replaceAll) await store.replaceAll(rows);
+    else for (const row of rows) await store.upsert(row.record, row.vector);
+    await writeEmbeddingModels(metadataPath, key, current);
+    ctx.ui.notify(`Re-embedded ${records.length} memories`, "info");
+    return true;
+  } catch (error) {
+    ctx.ui.notify(`Active Memory re-embedding failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    return false;
+  } finally {
+    ctx.ui.setWorkingMessage();
+  }
+}
+
+function sameEmbeddingModels(left: EmbeddingModels, right: EmbeddingModels): boolean {
+  return left.query === right.query && left.document === right.document;
+}
 
 export default function activeMemoryExtension(pi: ExtensionAPI) {
   let generation = 0;
@@ -121,6 +189,17 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     const thisGeneration = ++generation;
     paused = false; turns = 0; turnSequence = 0; toolResults = 0; thinkingCharacters = 0; lastError = undefined; investigation = undefined; initialRecallPrompt = undefined;
     config = await loadConfig(ctx.cwd, ctx.isProjectTrusted());
+    if (BUILT_IN_EMBEDDING_ADAPTERS.has(config.providers.embedding.adapter)) {
+      try {
+        configuredEmbeddingModels(config.providers.embedding.config);
+      } catch (error) {
+        paused = true;
+        lastError = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Active Memory configuration error: ${lastError}`, "error");
+        setStatus(ctx);
+        return;
+      }
+    }
     dailySweepGate.reset();
     steerLimiter = new MemorySteerLimiter(config.recall);
     feedbackLedger = new SteerFeedbackLedger();
@@ -157,6 +236,22 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     if (migratedProvenance) activity.log("provenance.migrated", { records: migratedProvenance });
     if (thisGeneration !== generation) return;
     embedder = await adapters.createEmbedding(config.providers.embedding, adapterContext);
+    let embeddingsCompatible = false;
+    try {
+      embeddingsCompatible = await ensureEmbeddingCompatibility(ctx, store, embedder, config.providers.rag);
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Active Memory embedding error: ${lastError}`, "error");
+    }
+    if (!embeddingsCompatible) {
+      paused = true;
+      lastError ??= "embedding models changed";
+      await store.close().catch(() => {});
+      store = undefined;
+      embedder = undefined;
+      setStatus(ctx);
+      return;
+    }
     const fast: FastModelRunner = await adapters.createLlm(config.providers.llm, adapterContext);
     engine = new MemoryEngine(config, store, embedder, fast, projectId, ctx.sessionManager.getSessionId(), ctx.cwd, (type, data) => {
       activity?.log(type, data);
@@ -430,7 +525,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           const controller = new AbortController();
           searchController = controller;
           void (async () => {
-            const [vector] = await embedder!.embed([query], controller.signal);
+            const [vector] = await embedQuery(embedder!, [query], controller.signal);
             if (!vector) throw new Error("Embedding failed");
             const found = await store!.search(vector, {
               scopes: ["global", "project"],
@@ -553,9 +648,9 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           priority: value.priority,
           status: value.status,
           updatedAt: new Date().toISOString(),
-          embeddingModel: embedder.model,
+          embeddingModel: embeddingModels(embedder).document,
         };
-        const [vector] = await embedder.embed([next.text]);
+        const [vector] = await embedDocuments(embedder, [next.text]);
         if (!vector) throw new Error("Embedding failed");
         await store.upsert(next, vector);
         activity?.log("memory.edited", { id: next.id, kind: next.kind, scope: next.scope, status: next.status, confidence: next.confidence, priority: next.priority, actor: next.source.actor ?? "user", ...(config.activityLog.includeText ? { text: next.text } : {}) });
@@ -811,7 +906,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     async execute(_id, params, signal) {
       if (!store || !config || !embedder) throw new Error("Memory store is not initialized");
       const currentConfig = config;
-      const [vector] = await embedder.embed([params.query], signal);
+      const [vector] = await embedQuery(embedder, [params.query], signal);
       if (!vector) throw new Error("Embedding failed");
       const scopes = params.scope === "global" ? ["global" as const] : params.scope === "project" ? ["project" as const] : ["global" as const, "project" as const];
       const limit = params.limit ?? 8;

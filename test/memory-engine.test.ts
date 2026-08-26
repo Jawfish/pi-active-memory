@@ -2,13 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { isRecentCurrentSessionMemory, MemoryEngine, rankMemoryMatches } from "../src/memory-engine.js";
-import type { FastModelRunner, MemoryFilter, MemoryMatch, MemoryRecord, VectorStore } from "../src/types.js";
+import type { EmbeddingProvider, FastModelRunner, MemoryFilter, MemoryMatch, MemoryRecord, VectorStore } from "../src/types.js";
 
 class Store implements VectorStore {
   records: MemoryRecord[] = [];
   matches: MemoryMatch[] = [];
+  lastSearchVector?: number[];
+  lastUpsertVector?: number[];
   async initialize(): Promise<void> {}
-  async upsert(record: MemoryRecord): Promise<void> {
+  async upsert(record: MemoryRecord, vector: number[]): Promise<void> {
+    this.lastUpsertVector = vector;
     const index = this.records.findIndex((candidate) => candidate.id === record.id);
     if (index >= 0) this.records[index] = record;
     else this.records.push(record);
@@ -19,7 +22,7 @@ class Store implements VectorStore {
     this.records[index] = record;
     return true;
   }
-  async search(_vector: number[], _filter: MemoryFilter, _limit: number): Promise<MemoryMatch[]> { return this.matches; }
+  async search(vector: number[], _filter: MemoryFilter, _limit: number): Promise<MemoryMatch[]> { this.lastSearchVector = vector; return this.matches; }
   async list(): Promise<MemoryRecord[]> { return this.records; }
   async markDeleted(): Promise<boolean> { return false; }
   async migrateLegacyProvenance(): Promise<number> { return 0; }
@@ -35,8 +38,8 @@ class Fast implements FastModelRunner {
 
 const embedder = { model: "test/embed", embed: async (texts: string[]) => texts.map(() => [1, 0]) };
 
-function engine(response: unknown | unknown[], store: Store): MemoryEngine {
-  return new MemoryEngine(DEFAULT_CONFIG, store, embedder as never, new Fast(Array.isArray(response) ? response : [response]), "project", "session", "/cwd");
+function engine(response: unknown | unknown[], store: Store, embedding: EmbeddingProvider = embedder): MemoryEngine {
+  return new MemoryEngine(DEFAULT_CONFIG, store, embedding, new Fast(Array.isArray(response) ? response : [response]), "project", "session", "/cwd");
 }
 
 test("capture rejects a candidate sourced only from assistant context", async () => {
@@ -185,6 +188,28 @@ test("ranking lowers assistant memories by confidence and priority", () => {
   const ranked = rankMemoryMatches([{ record: assistant, score: 0.99 }, { record: user, score: 0.8 }]);
   assert.deepEqual(ranked.map((match) => match.record.id), ["user", "assistant"]);
   assert.ok(ranked[1]!.score < 0.55);
+});
+
+test("recall uses query embeddings while stored memories use document embeddings", async () => {
+  const dual: EmbeddingProvider = {
+    queryModel: "test/query",
+    documentModel: "test/document",
+    embedQuery: async (texts) => texts.map(() => [1, 0]),
+    embedDocuments: async (texts) => texts.map(() => [0, 1]),
+  };
+  const store = new Store();
+  const existing = memory("existing", "old", "2020-01-01T00:00:00Z");
+  store.matches = [{ record: existing, score: 0.9 }];
+  await engine([{ query: "fact" }, { relevantIds: ["existing"], reason: "Relevant" }], store, dual).recall("current task");
+  assert.deepEqual(store.lastSearchVector, [1, 0]);
+
+  store.matches = [];
+  await engine([
+    { memories: [{ text: "The project uses a generated cache.", kind: "fact", scope: "project", confidence: 0.8, evidence: "uses a generated cache" }] },
+    { accept: true, reason: "Durable project fact" },
+  ], store, dual).capture("The project uses a generated cache.", "");
+  assert.deepEqual(store.lastUpsertVector, [0, 1]);
+  assert.equal(store.records.at(-1)?.embeddingModel, "test/document");
 });
 
 test("recent-memory filter suppresses only young memories from the current session", () => {

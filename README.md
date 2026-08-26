@@ -281,6 +281,28 @@ The Ollama chat model must also be configured in Pi's `models.json`.
 }
 ```
 
+### Separate query and document embedding models
+
+Providers with asymmetric embedding models can replace `model` with both model names:
+
+```json
+{
+  "providers": {
+    "embedding": {
+      "adapter": "openai-compatible",
+      "config": {
+        "queryModel": "provider/query-embed",
+        "documentModel": "provider/document-embed",
+        "baseUrl": "https://embedding.example.com/v1",
+        "apiKeyEnv": "EMBEDDING_API_KEY"
+      }
+    }
+  }
+}
+```
+
+Configure either `model` or both `queryModel` and `documentModel`; mixing the two forms or omitting one separate model deactivates the plugin with a configuration error.
+
 ### Qdrant
 
 ```json
@@ -298,7 +320,7 @@ The Ollama chat model must also be configured in Pi's `models.json`.
 }
 ```
 
-The collection is created on the first embedding write. Changing embedding dimensions requires a new collection or re-embedding existing memories.
+The collection is created on the first embedding write. Active Memory records the query/document model pair per vector store. If it changes, startup warns and asks to re-embed every memory; declining or a failed migration deactivates the plugin for that session. Re-embedding recreates Qdrant collections when dimensions change.
 
 ## Third-party adapters
 
@@ -314,9 +336,10 @@ export default function (pi: ExtensionAPI) {
     adapters.registerEmbedding("my-embedding", (config) => ({
       model: `my-embedding/${config.model}`,
       async embed(texts, signal) {
-        // Call any local or remote embedding service.
         return embedWithMyProvider(texts, config, signal);
       },
+      // Alternatively expose queryModel/documentModel plus
+      // embedQuery()/embedDocuments() for asymmetric providers.
     }));
   });
 }

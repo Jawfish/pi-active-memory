@@ -58,6 +58,13 @@ function merge<T>(base: T, patch: unknown): T {
     return { ...patchObject } as T;
   }
   const out: JsonObject = { ...baseObject };
+  const hasUnifiedEmbeddingModel = Object.hasOwn(patchObject, "model");
+  const hasSeparateEmbeddingModel = Object.hasOwn(patchObject, "queryModel") || Object.hasOwn(patchObject, "documentModel");
+  if (hasSeparateEmbeddingModel && !hasUnifiedEmbeddingModel) delete out.model;
+  if (hasUnifiedEmbeddingModel && !hasSeparateEmbeddingModel) {
+    delete out.queryModel;
+    delete out.documentModel;
+  }
   for (const [key, value] of Object.entries(patch as JsonObject)) {
     const current = out[key];
     out[key] = current && typeof current === "object" && !Array.isArray(current) && value && typeof value === "object" && !Array.isArray(value)

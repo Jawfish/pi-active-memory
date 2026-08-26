@@ -63,6 +63,39 @@ export class QdrantVectorStore implements VectorStore {
     return (json.result?.points ?? []).map((point) => point.payload).filter(Boolean).map(normalizeProvenance);
   }
 
+  async listAll(): Promise<MemoryRecord[]> {
+    const records: MemoryRecord[] = [];
+    let offset: unknown;
+    do {
+      const response = await this.request(`/collections/${encodeURIComponent(this.collection)}/points/scroll`, {
+        method: "POST", body: JSON.stringify({ limit: 256, offset, with_payload: true, with_vector: false }),
+      });
+      if (response.status === 404) return [];
+      if (!response.ok) throw new Error(`Qdrant full scan failed: ${await response.text()}`);
+      const json = await response.json() as { result?: { points?: Array<{ payload: MemoryRecord }>; next_page_offset?: unknown } };
+      records.push(...(json.result?.points ?? []).map((point) => point.payload).filter(Boolean).map(normalizeProvenance));
+      offset = json.result?.next_page_offset;
+    } while (offset !== undefined && offset !== null);
+    return records;
+  }
+
+  async replaceAll(rows: Array<{ record: MemoryRecord; vector: number[] }>): Promise<void> {
+    const dimension = rows[0]?.vector.length;
+    if (!dimension) return;
+    if (rows.some((row) => row.vector.length !== dimension)) throw new Error("Re-embedding produced inconsistent vector dimensions");
+    const removed = await this.request(`/collections/${encodeURIComponent(this.collection)}`, { method: "DELETE" });
+    if (!removed.ok && removed.status !== 404) throw new Error(`Qdrant collection reset failed: ${await removed.text()}`);
+    this.dimension = undefined;
+    await this.initialize(dimension);
+    for (let offset = 0; offset < rows.length; offset += 128) {
+      const points = rows.slice(offset, offset + 128).map(({ record, vector }) => ({ id: record.id, vector, payload: normalizeProvenance(record) }));
+      const response = await this.request(`/collections/${encodeURIComponent(this.collection)}/points?wait=true`, {
+        method: "PUT", body: JSON.stringify({ points }),
+      });
+      if (!response.ok) throw new Error(`Qdrant re-embedding upload failed: ${await response.text()}`);
+    }
+  }
+
   async markDeleted(id: string): Promise<boolean> {
     const lookup = await this.request(`/collections/${encodeURIComponent(this.collection)}/points`, {
       method: "POST", body: JSON.stringify({ ids: [id], with_payload: true, with_vector: false }),

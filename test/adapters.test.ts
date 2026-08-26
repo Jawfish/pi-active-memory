@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AdapterRegistry, createBuiltInAdapterRegistry } from "../src/adapters.js";
+import { AdapterRegistry, configuredEmbeddingModels, createBuiltInAdapterRegistry } from "../src/adapters.js";
+import { embedDocuments, embeddingModels, embedQuery } from "../src/embeddings.js";
 
 const context = {
   cwd: "/project",
@@ -44,6 +45,28 @@ test("built-in registry exposes independent rag, embedding, and llm adapters", a
   }, context as never);
 
   assert.equal(typeof rag.search, "function");
-  assert.equal(embedding.model, "ollama/embed");
+  assert.deepEqual(embeddingModels(embedding), { query: "ollama/embed", document: "ollama/embed" });
   assert.equal(llm.selectedModel(), undefined);
+});
+
+test("embedding configuration requires unified or complete separate models", () => {
+  assert.deepEqual(configuredEmbeddingModels({ model: "unified" }), { query: "unified", document: "unified" });
+  assert.deepEqual(configuredEmbeddingModels({ queryModel: "query", documentModel: "document" }), { query: "query", document: "document" });
+  assert.throws(() => configuredEmbeddingModels({ model: "unified", queryModel: "query", documentModel: "document" }), /not both/);
+  assert.throws(() => configuredEmbeddingModels({ queryModel: "query" }), /both queryModel and documentModel/);
+});
+
+test("separate embedding providers route query and document inputs independently", async () => {
+  const calls: string[] = [];
+  const provider = {
+    queryModel: "query/model",
+    documentModel: "document/model",
+    embedQuery: async (texts: string[]) => { calls.push(`query:${texts.join(",")}`); return [[1]]; },
+    embedDocuments: async (texts: string[]) => { calls.push(`document:${texts.join(",")}`); return [[2]]; },
+  };
+  assert.deepEqual(embeddingModels(provider), { query: "query/model", document: "document/model" });
+  assert.throws(() => embeddingModels({ ...provider, model: "unified/model" }), /both unified and separate/);
+  assert.deepEqual(await embedQuery(provider, ["search"]), [[1]]);
+  assert.deepEqual(await embedDocuments(provider, ["memory"]), [[2]]);
+  assert.deepEqual(calls, ["query:search", "document:memory"]);
 });

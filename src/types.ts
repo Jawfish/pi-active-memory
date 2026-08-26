@@ -72,14 +72,28 @@ export interface VectorStore {
   update(record: MemoryRecord): Promise<boolean>;
   search(vector: number[], filter: MemoryFilter, limit: number): Promise<MemoryMatch[]>;
   list(filter: MemoryFilter, limit: number): Promise<MemoryRecord[]>;
+  listAll?(): Promise<MemoryRecord[]>;
+  replaceAll?(rows: Array<{ record: MemoryRecord; vector: number[] }>): Promise<void>;
   markDeleted(id: string): Promise<boolean>;
   migrateLegacyProvenance(): Promise<number>;
   close(): Promise<void>;
 }
 
+export interface EmbeddingModels {
+  query: string;
+  document: string;
+}
+
 export interface EmbeddingProvider {
-  readonly model: string;
-  embed(texts: string[], signal?: AbortSignal): Promise<number[][]>;
+  /** Legacy unified model identity. */
+  readonly model?: string;
+  /** Separate model identities for asymmetric embedding providers. */
+  readonly queryModel?: string;
+  readonly documentModel?: string;
+  /** Legacy unified embedding method. */
+  embed?(texts: string[], signal?: AbortSignal): Promise<number[][]>;
+  embedQuery?(texts: string[], signal?: AbortSignal): Promise<number[][]>;
+  embedDocuments?(texts: string[], signal?: AbortSignal): Promise<number[][]>;
 }
 
 export interface EmbeddingConfig {

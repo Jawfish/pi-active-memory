@@ -1,4 +1,4 @@
-import type { EmbeddingConfig } from "./types.js";
+import type { EmbeddingConfig, EmbeddingModels, EmbeddingProvider } from "./types.js";
 
 export class Embedder {
   constructor(private readonly config: EmbeddingConfig, private readonly resolvedApiKey?: string) {}
@@ -30,4 +30,37 @@ export class Embedder {
     if (rows.length !== texts.length) throw new Error("Embedding provider returned an unexpected number of vectors");
     return rows;
   }
+}
+
+export class RoutedEmbedder implements EmbeddingProvider {
+  readonly queryModel: string;
+  readonly documentModel: string;
+
+  constructor(private readonly query: Embedder, private readonly document: Embedder) {
+    this.queryModel = query.model;
+    this.documentModel = document.model;
+  }
+
+  embedQuery(texts: string[], signal?: AbortSignal): Promise<number[][]> { return this.query.embed(texts, signal); }
+  embedDocuments(texts: string[], signal?: AbortSignal): Promise<number[][]> { return this.document.embed(texts, signal); }
+}
+
+export function embeddingModels(provider: EmbeddingProvider): EmbeddingModels {
+  const hasSeparate = Boolean(provider.queryModel || provider.documentModel);
+  if (provider.model && hasSeparate) throw new Error("Embedding adapter exposes both unified and separate model identities");
+  if (provider.queryModel && provider.documentModel) return { query: provider.queryModel, document: provider.documentModel };
+  if (provider.model) return { query: provider.model, document: provider.model };
+  throw new Error("Embedding adapter must expose either model or both queryModel and documentModel");
+}
+
+export function embedQuery(provider: EmbeddingProvider, texts: string[], signal?: AbortSignal): Promise<number[][]> {
+  if (provider.embedQuery) return provider.embedQuery(texts, signal);
+  if (provider.embed) return provider.embed(texts, signal);
+  throw new Error("Embedding adapter does not implement query embedding");
+}
+
+export function embedDocuments(provider: EmbeddingProvider, texts: string[], signal?: AbortSignal): Promise<number[][]> {
+  if (provider.embedDocuments) return provider.embedDocuments(texts, signal);
+  if (provider.embed) return provider.embed(texts, signal);
+  throw new Error("Embedding adapter does not implement document embedding");
 }

@@ -1,4 +1,4 @@
-import { Embedder } from "./embeddings.js";
+import { Embedder, RoutedEmbedder } from "./embeddings.js";
 import { PiFastModel } from "./fast-model.js";
 import { JsonVectorStore } from "./stores/json-store.js";
 import { QdrantVectorStore } from "./stores/qdrant-store.js";
@@ -69,18 +69,22 @@ export function createBuiltInAdapterRegistry(): AdapterRegistry {
 
   for (const provider of ["openai", "openai-compatible", "ollama"] as const) {
     registry.registerEmbedding(provider, async (config, context) => {
-      const embeddingConfig: EmbeddingConfig = {
+      const models = configuredEmbeddingModels(config);
+      const baseConfig = {
         provider,
-        model: requiredString(config.model, "providers.embedding.config.model"),
         baseUrl: requiredString(config.baseUrl, "providers.embedding.config.baseUrl"),
         ...(typeof config.apiKeyEnv === "string" ? { apiKeyEnv: config.apiKeyEnv } : {}),
         ...(typeof config.dimensions === "number" ? { dimensions: config.dimensions } : {}),
       };
-      const envName = embeddingConfig.apiKeyEnv ?? "OPENAI_API_KEY";
+      const envName = baseConfig.apiKeyEnv ?? "OPENAI_API_KEY";
       const resolvedApiKey = provider === "openai" && !process.env[envName]
         ? await context.extensionContext.modelRegistry.getApiKeyForProvider("openai")
         : undefined;
-      return new Embedder(embeddingConfig, resolvedApiKey);
+      const query = new Embedder({ ...baseConfig, model: models.query } satisfies EmbeddingConfig, resolvedApiKey);
+      const document = models.document === models.query
+        ? query
+        : new Embedder({ ...baseConfig, model: models.document } satisfies EmbeddingConfig, resolvedApiKey);
+      return new RoutedEmbedder(query, document);
     });
   }
 
@@ -90,6 +94,16 @@ export function createBuiltInAdapterRegistry(): AdapterRegistry {
     maxTokens: requiredNumber(config.maxTokens, "providers.llm.config.maxTokens"),
   } satisfies FastModelConfig, context.extensionContext));
   return registry;
+}
+
+export function configuredEmbeddingModels(config: Record<string, unknown>): { query: string; document: string } {
+  const unified = typeof config.model === "string" && config.model.trim() ? config.model.trim() : undefined;
+  const query = typeof config.queryModel === "string" && config.queryModel.trim() ? config.queryModel.trim() : undefined;
+  const document = typeof config.documentModel === "string" && config.documentModel.trim() ? config.documentModel.trim() : undefined;
+  if (unified && (query || document)) throw new Error("Configure either providers.embedding.config.model or queryModel/documentModel, not both");
+  if (unified) return { query: unified, document: unified };
+  if (!query || !document) throw new Error("Configure either providers.embedding.config.model or both queryModel and documentModel");
+  return { query, document };
 }
 
 function requiredString(value: unknown, path: string): string {

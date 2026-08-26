@@ -69,6 +69,22 @@ export class JsonVectorStore implements VectorStore {
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, limit);
   }
 
+  async listAll(): Promise<MemoryRecord[]> {
+    await this.initialize();
+    return this.data.rows.map((row) => row.record);
+  }
+
+  async replaceAll(rows: Row[]): Promise<void> {
+    await this.initialize();
+    const dimension = rows[0]?.vector.length;
+    if (rows.some((row) => row.vector.length !== dimension)) throw new Error("Re-embedding produced inconsistent vector dimensions");
+    await this.serial(async () => {
+      this.data.rows = rows.map((row) => ({ record: normalizeProvenance(row.record), vector: row.vector }));
+      this.data.dimension = dimension;
+      await this.persist();
+    });
+  }
+
   async markDeleted(id: string): Promise<boolean> {
     await this.initialize();
     let found = false;

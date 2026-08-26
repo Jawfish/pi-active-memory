@@ -28,6 +28,21 @@ test("JSON store migrates legacy records to complete provenance", async () => {
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("JSON store replaces all vectors when re-embedding changes dimensions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "active-memory-reembed-"));
+  try {
+    const store = new JsonVectorStore(join(dir, "db.json"));
+    await store.upsert(record("one", "global"), [1, 0]);
+    await store.upsert(record("two", "global"), [0, 1]);
+    await store.replaceAll([
+      { record: { ...record("one", "global"), embeddingModel: "new-document" }, vector: [1, 0, 0] },
+      { record: { ...record("two", "global"), embeddingModel: "new-document" }, vector: [0, 1, 0] },
+    ]);
+    assert.deepEqual((await store.listAll()).map((item) => item.embeddingModel), ["new-document", "new-document"]);
+    assert.equal((await store.search([1, 0, 0], {}, 1))[0]?.record.id, "one");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("JSON store performs vector search and scope filtering", async () => {
   const dir = await mkdtemp(join(tmpdir(), "active-memory-"));
   try {

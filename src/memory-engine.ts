@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ActivitySink } from "./activity-log.js";
 import { pairSimilarMemories, type CompactionProposal, type MemoryCluster } from "./compaction.js";
+import { embedDocuments, embeddingModels, embedQuery } from "./embeddings.js";
 import type { ActiveMemoryConfig, EmbeddingProvider, FastModelRunner, MemoryActor, MemoryKind, MemoryMatch, MemoryRecord, MemoryScope, MemorySource, VectorStore } from "./types.js";
 import { applyConfidenceFeedback, type FeedbackOutcome } from "./feedback.js";
 import { advanceMemoryLifecycle, initializeMemoryLifecycle, reinforceMemoryLifecycle } from "./lifecycle.js";
@@ -165,9 +166,9 @@ export class MemoryEngine {
       confidence: Math.min(record.confidence, this.config.assistantCapture.maximumConfidence),
       priority: Math.min(record.priority ?? this.config.assistantCapture.priority, this.config.assistantCapture.priority),
       updatedAt: now,
-      embeddingModel: this.embedder.model,
+      embeddingModel: embeddingModels(this.embedder).document,
     };
-    const [vector] = await this.embedder.embed([text], signal);
+    const [vector] = await embedDocuments(this.embedder, [text], signal);
     if (!vector) throw new Error("Embedding failed");
     await this.store.upsert(updated, vector);
     this.activity?.("memory.corrected", { id: memoryId, actor: "assistant", ...(this.config.activityLog.includeText ? { previousText: record.text, text, reason: source.reason } : {}) });
@@ -218,7 +219,7 @@ export class MemoryEngine {
   async planCompaction(signal?: AbortSignal): Promise<CompactionPlan> {
     const records = await this.store.list({ status: "active", scopes: ["global", "project"], kinds: ["user_profile", "fact", "skill_workflow"], projectId: this.projectId }, 10000);
     if (records.length < 2) return { clusters: [], proposals: [] };
-    const vectors = await this.embedder.embed(records.map((record) => record.text), signal);
+    const vectors = await embedDocuments(this.embedder, records.map((record) => record.text), signal);
     const clusters = pairSimilarMemories(records, vectors, this.config.compaction.similarityThreshold, this.config.compaction.maximumProposals);
     const proposals: CompactionProposal[] = [];
     for (const cluster of clusters) {
@@ -292,13 +293,13 @@ export class MemoryEngine {
       } : {}),
       createdAt: records.map((record) => record.createdAt).sort()[0] ?? now,
       updatedAt: now,
-      embeddingModel: this.embedder.model,
+      embeddingModel: embeddingModels(this.embedder).document,
       schemaVersion: 2,
     };
     const compacted = this.config.memoryLifecycle.enabled
       ? reinforceMemoryLifecycle(baseCompacted, new Date(now), this.sessionId, this.config.memoryLifecycle, "user_compaction")
       : baseCompacted;
-    const [vector] = await this.embedder.embed([compacted.text], signal);
+    const [vector] = await embedDocuments(this.embedder, [compacted.text], signal);
     if (!vector) throw new Error("Embedding failed");
     await this.store.upsert(compacted, vector);
     for (const record of records) {
@@ -316,7 +317,7 @@ export class MemoryEngine {
     const query = await this.fast.json<{ query?: string }>(this.config.prompts.jsonOnly, queryPrompt(context, this.config.prompts), signal);
     this.activity?.("recall.query", { query: this.config.activityLog.includeText ? query.query ?? "" : undefined, fastModel: this.fast.selectedModel() });
     if (!query.query?.trim()) return undefined;
-    const [vector] = await this.embedder.embed([query.query.trim()], signal);
+    const [vector] = await embedQuery(this.embedder, [query.query.trim()], signal);
     if (!vector) return undefined;
     const searchLimit = Math.max(this.config.recall.topK * 5, this.config.recall.topK + 20);
     const searched = await this.store.search(vector, { status: "active", scopes: ["global", "project"], kinds: ["user_profile", "fact", "skill_workflow"], projectId: this.projectId }, searchLimit);
@@ -377,7 +378,7 @@ export class MemoryEngine {
     let text = raw.text.trim().slice(0, this.config.security.maxMemoryCharacters);
     if (this.config.security.redactSecrets) text = redactSecrets(text);
     if (!text || text.includes("[REDACTED_PRIVATE_KEY]")) return false;
-    const [vector] = await this.embedder.embed([text], signal);
+    const [vector] = await embedDocuments(this.embedder, [text], signal);
     if (!vector) return false;
 
     const nearest = await this.store.search(vector, {
@@ -412,7 +413,7 @@ export class MemoryEngine {
     if (text !== raw.text.trim() && !await validateCanonical(text)) return false;
 
     if (this.config.security.redactSecrets) text = redactSecrets(text);
-    const [canonicalVector] = text === raw.text.trim() ? [vector] : await this.embedder.embed([text], signal);
+    const [canonicalVector] = text === raw.text.trim() ? [vector] : await embedDocuments(this.embedder, [text], signal);
     if (!canonicalVector) return false;
     const replacing = action === "replace" ? target : undefined;
     const now = new Date().toISOString();
@@ -433,7 +434,7 @@ export class MemoryEngine {
       ...(replacing?.lifecycle ? { lifecycle: replacing.lifecycle } : {}),
       createdAt: replacing?.createdAt ?? now,
       updatedAt: now,
-      embeddingModel: this.embedder.model,
+      embeddingModel: embeddingModels(this.embedder).document,
       schemaVersion: 2,
     };
     const record = this.config.memoryLifecycle.enabled
