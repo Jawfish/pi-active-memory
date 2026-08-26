@@ -13,7 +13,7 @@ import { DEFAULT_CONFIG, loadConfig, publicConfig, saveUserCompactionThreshold, 
 import { SteerFeedbackLedger } from "./feedback.js";
 import { ActiveMemoryFooterStatus } from "./footer-status.js";
 import { MemoryEngine, rankMemoryMatches } from "./memory-engine.js";
-import { renderPrompt, steerFeedbackPrompt } from "./prompts.js";
+import { renderPrompt, structuredSteerMessage } from "./prompts.js";
 import { emptySessionStats, formatSessionStats, SESSION_STATS_ENTRY_TYPE, sessionStatsFromEntries, type SessionStatName } from "./session-stats.js";
 import { activeMemoryStatus, compactionProgressStatus } from "./status.js";
 import { formatSteerSentence, orderedFeedbackOutcomes, type SteerFeedbackOutcome } from "./steer-display.js";
@@ -320,15 +320,24 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           const recalled = await engine.recall(job.context, job.ctx.signal, suppressedIds, job.activeContext);
           if (!recalled || job.generation !== generation) continue;
           const details = makeDetails(recalled, projectId);
-          if (isDuplicateSteer(details, recalled.instruction)) continue;
-          rememberSteer(details, recalled.instruction);
+          const surfacedText = recalled.relevant.map((match) => match.record.text).join(" ");
+          if (isDuplicateSteer(details, surfacedText)) continue;
+          rememberSteer(details, surfacedText);
           feedbackLedger.register(details.feedbackToken, details.memoryIds);
           lastRecall = details;
           const delivery = job.ctx.isIdle() ? "nextTurn" : "steer";
-          const feedbackHint = `\n\n${steerFeedbackPrompt(config.prompts.steerFeedback, details.feedbackToken, details.memoryIds)}`;
-          pi.sendMessage({ customType: "active-memory-steer", content: `${recalled.instruction}${feedbackHint}`, display: true, details }, { deliverAs: delivery, triggerTurn: false });
+          const feedbackGuidance = renderPrompt(config.prompts.steerFeedback, {
+            feedbackToken: details.feedbackToken,
+            memoryIds: JSON.stringify(details.memoryIds),
+          });
+          const content = structuredSteerMessage(
+            recalled.relevant.map((match) => ({ id: match.record.id, text: match.record.text })),
+            details.feedbackToken,
+            feedbackGuidance,
+          );
+          pi.sendMessage({ customType: "active-memory-steer", content, display: true, details }, { deliverAs: delivery, triggerTurn: false });
           incrementSessionStat("memorySteers");
-          activity?.log("steer.queued", { delivery, ...details, ...(config.activityLog.includeText ? { instruction: recalled.instruction } : {}) });
+          activity?.log("steer.queued", { delivery, ...details, ...(config.activityLog.includeText ? { memories: recalled.relevant.map((match) => match.record.text) } : {}) });
           lastError = undefined;
         } catch (error) {
           lastError = error instanceof Error ? error.message : String(error);
@@ -343,7 +352,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   }
 
   function makeDetails(recalled: Awaited<ReturnType<MemoryEngine["recall"]>> & {}, id: string): SteerDetails {
-    return { memoryIds: recalled.relevant.map((m) => m.record.id), scores: recalled.relevant.map((m) => m.score), reason: recalled.reason, instruction: recalled.instruction, projectId: id, feedbackToken: randomUUID(), source: "active-memory" };
+    return { memoryIds: recalled.relevant.map((m) => m.record.id), scores: recalled.relevant.map((m) => m.score), reason: recalled.reason, instruction: recalled.relevant.map((m) => m.record.text).join(" "), projectId: id, feedbackToken: randomUUID(), source: "active-memory" };
   }
   function recordDisplayedFeedback(steerToken: string, memoryId: string, outcome: SteerFeedbackOutcome): void {
     const outcomes = feedbackBySteer.get(steerToken) ?? new Map<string, SteerFeedbackOutcome>();

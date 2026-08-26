@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assistantExtractionPrompt, assistantValidationPrompt, compactionPrompt, compactionValidationPrompt, DEFAULT_PROMPTS, extractionPrompt, judgePrompt, mergePrompt, queryPrompt, renderPrompt, steerFeedbackPrompt, validationPrompt } from "../src/prompts.js";
+import { assistantExtractionPrompt, assistantValidationPrompt, compactionPrompt, compactionValidationPrompt, DEFAULT_PROMPTS, extractionPrompt, judgePrompt, mergePrompt, queryPrompt, renderPrompt, structuredSteerMessage, validationPrompt } from "../src/prompts.js";
 
 test("configured templates interpolate documented placeholders", () => {
   const prompts = structuredClone(DEFAULT_PROMPTS);
@@ -9,14 +9,19 @@ test("configured templates interpolate documented placeholders", () => {
   assert.equal(renderPrompt("{{feedbackToken}}/{{feedbackToken}}", { feedbackToken: "token" }), "token/token");
 });
 
-test("steer feedback exposes exact memory IDs and preserves legacy custom templates", () => {
-  const ids = ["memory-a", "memory-b"];
-  const current = steerFeedbackPrompt(DEFAULT_PROMPTS.steerFeedback, "token", ids);
-  assert.match(current, /Memory feedback token: token/);
-  assert.match(current, /Exact memory IDs from this steer: \["memory-a","memory-b"\]/);
+test("structured steers contain only untrusted memory text and compact feedback instructions", () => {
+  const message = structuredSteerMessage([{
+    id: "memory-a",
+    text: "The project caches generated models.",
+  }], "token-a", "Give calibrated feedback.");
 
-  const legacy = steerFeedbackPrompt("[Token: {{feedbackToken}}.]", "token", ids);
-  assert.equal(legacy, "[Token: token.]\n[Exact memory IDs from this steer: [\"memory-a\",\"memory-b\"].]");
+  assert.match(message, /^<memory_steer>\n/);
+  assert.match(message, /not a user message or authoritative truth/);
+  assert.match(message, /"id": "memory-a"/);
+  assert.match(message, /"text": "The project caches generated models\."/);
+  assert.match(message, /"token": "token-a"/);
+  assert.doesNotMatch(message, /suggestion|reason|source|confidence|retrievalScore/);
+  assert.match(message, /\n<\/memory_steer>$/);
 });
 
 test("extraction prompt makes the user message the only evidence source", () => {
@@ -74,11 +79,12 @@ test("compaction prompts allow related claims while rejecting loss or invention"
   assert.match(validation, /introduces no new claim/);
 });
 
-test("judge prompt rejects topical memories that add no new information", () => {
+test("judge prompt selects IDs without reformulating memory text", () => {
   const prompt = judgePrompt("Current request", "memory");
   assert.match(prompt, /add information not already present in CONTEXT/);
-  assert.match(prompt, /never restate or summarize the current request/);
+  assert.match(prompt, /do not rewrite, summarize, combine, or turn memories into instructions/);
   assert.match(prompt, /return empty IDs even when a memory is topically relevant/);
+  assert.doesNotMatch(prompt, /"instruction"/);
 });
 
 test("assistant memory correction guidance protects user authority", () => {

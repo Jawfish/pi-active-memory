@@ -23,7 +23,7 @@ user/long investigation ──► fast validation model ──► embeddings ─
 - User-only `/memory-compact` reviews one related pair at a time before consolidating it; it never merges across scope, kind, project, or user/assistant authority.
 - Supports global and project-scoped memories through metadata filters.
 - Recalls before a new agent run and periodically during longer tool/reasoning loops.
-- Uses Pi custom messages, so memory steers are visibly different from user messages.
+- Uses clearly labelled Pi custom messages containing selected memories verbatim, with compact feedback instructions.
 - Rejects current-task state, progress, next steps, TODOs, one-off requests, and unrelated project activity.
 - Exposes `memory_search` for deliberate manual lookup, while telling the agent not to search redundantly because background recall is active.
 - Soft-deletes memories for recoverability and retains the source user message and exact evidence quote.
@@ -121,7 +121,7 @@ All model-facing prompt text is configurable under `prompts`. Override only the 
 | `judge` | `context`, `candidates` |
 | `steerFeedback` | `feedbackToken`, `memoryIds` |
 
-Every steer exposes its exact memory IDs. Legacy custom `steerFeedback` templates without `{{memoryIds}}` receive an appended ID line automatically, so `memory_feedback` always has the required identifier.
+Every steer includes each selected memory's exact ID and verbatim text plus a feedback token. `steerFeedback` configures only the short feedback guidance; its placeholders remain available but are optional because IDs and the token are structured fields.
 
 `prompts.jsonOnly` configures the fast-model system instruction. The snippet and guideline arrays for `memory_store_result`, `memory_correct`, `memory_search`, and `memory_feedback` are under `prompts.tools`. Unknown placeholders are left unchanged, which makes partial migration of custom templates safe.
 
@@ -129,7 +129,7 @@ Every steer exposes its exact memory IDs. Legacy custom `steerFeedback` template
 {
   "prompts": {
     "query": "Return a semantic memory query for this context as JSON: {{context}}",
-    "steerFeedback": "[Token: {{feedbackToken}}. Memory IDs: {{memoryIds}}. Rate irrelevant memory unhelpful, plan-changing memory useful, and relevant but redundant memory not at all.]",
+    "steerFeedback": "If possible, rate irrelevant memory unhelpful, plan-changing memory useful, and relevant but redundant memory not at all.",
     "tools": {
       "memoryFeedback": {
         "guidelines": ["Use memory_feedback according to the configured relevance policy."]
@@ -395,7 +395,7 @@ The activity file records ordered lifecycle, capture, extraction, evidence rejec
 
 The logger serializes appends through one write queue and forces permissions to `0600`. If Pi is running with `--no-session`, there is no session path and no activity file is created.
 
-Set `activityLog.enabled` to `false` to disable it. Set `activityLog.includeText` to `false` to preserve IDs, scores, scopes, kinds, decisions, counts, models, and errors while omitting user text, memory text, queries, reasons, and steer instructions.
+Set `activityLog.enabled` to `false` to disable it. Set `activityLog.includeText` to `false` to preserve IDs, scores, scopes, kinds, decisions, counts, models, and errors while omitting user text, memory text, queries, and reasons.
 
 ## Compaction, feedback, and forgetting
 
@@ -411,7 +411,7 @@ Useful feedback raises confidence and reduces `decayRate`, making repeatedly use
 
 A memory is never eligible for recall while its stored source user text or evidence still appears in Pi's active context after compaction processing. This suppression follows the actual active context rather than relying only on session IDs, so it also works across resumed/forked session files and stops once compaction removes the source passage.
 
-As an additional guard, a memory created in the current Pi session is not eligible for retrieval until it is 30 minutes old by default. The originating user message should still be available in the live context, so recalling it immediately would be redundant and could create feedback loops. The recall judge also rejects topically relevant memories that add nothing beyond live context and is instructed to emit only novel memory-derived information rather than restating or blending in the current request.
+As an additional guard, a memory created in the current Pi session is not eligible for retrieval until it is 30 minutes old by default. The originating user message should still be available in the live context, so recalling it immediately would be redundant and could create feedback loops. The recall judge only selects IDs that add information beyond live context; selected memories are surfaced verbatim without fast-model rewriting or synthesis.
 
 Configure the window with `recall.minimumMemoryAgeMinutes`; set it to `0` to disable suppression. The filter applies only when both conditions hold:
 

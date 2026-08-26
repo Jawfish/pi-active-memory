@@ -9,7 +9,7 @@ import { evidenceAppearsInUserMessage, isTransientTaskMemory, redactSecrets, sou
 
 interface Extracted { text: string; kind: MemoryKind; scope: MemoryScope; confidence: number; evidence: string }
 interface AssistantExtracted extends Extracted { whyStored: string }
-interface RecallResult { instruction: string; reason: string; relevant: MemoryMatch[] }
+interface RecallResult { reason: string; relevant: MemoryMatch[] }
 export interface AssistantResultInput { text: string; kind: Exclude<MemoryKind, "user_profile">; scope: MemoryScope; confidence: number; reason: string }
 export interface CompactionPlan { clusters: MemoryCluster[]; proposals: CompactionProposal[] }
 
@@ -334,17 +334,17 @@ export class MemoryEngine {
     this.activity?.("recall.matches", { matches: matches.map((match) => ({ id: match.record.id, score: match.score, scope: match.record.scope, kind: match.record.kind, actor: memoryActor(match.record), confidence: match.record.confidence, ...(this.config.activityLog.includeText ? { text: match.record.text } : {}) })) });
     if (!matches.length) return undefined;
     const candidates = matches.map((match) => `${match.record.id} rank=${match.score.toFixed(3)} source=${memoryActor(match.record)} confidence=${match.record.confidence.toFixed(2)} scope=${match.record.scope} kind=${match.record.kind}\n${match.record.text}`).join("\n\n");
-    const judged = await this.fast.json<{ relevantIds?: string[]; instruction?: string; reason?: string }>(this.config.prompts.jsonOnly, judgePrompt(context, candidates, this.config.prompts), signal);
+    const judged = await this.fast.json<{ relevantIds?: string[]; reason?: string }>(this.config.prompts.jsonOnly, judgePrompt(context, candidates, this.config.prompts), signal);
     const ids = new Set(judged.relevantIds ?? []);
     const relevant = matches.filter((match) => ids.has(match.record.id));
     this.activity?.("recall.judged", {
       relevantIds: relevant.map((match) => match.record.id),
-      ...(this.config.activityLog.includeText ? { instruction: judged.instruction ?? "", reason: judged.reason ?? "" } : {}),
+      ...(this.config.activityLog.includeText ? { reason: judged.reason ?? "" } : {}),
       fastModel: this.fast.selectedModel(),
     });
-    if (!judged.instruction?.trim() || !relevant.length) return undefined;
+    if (!relevant.length) return undefined;
     if (this.config.memoryLifecycle.enabled) await this.reinforceRecords(relevant.map((match) => match.record), "relevant_recall");
-    return { instruction: judged.instruction.trim(), reason: judged.reason?.trim() ?? "", relevant };
+    return { reason: judged.reason?.trim() ?? "", relevant };
   }
 
   private async reinforceRecords(records: MemoryRecord[], cause: "relevant_recall" | "useful_feedback"): Promise<void> {

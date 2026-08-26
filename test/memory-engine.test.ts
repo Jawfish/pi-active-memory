@@ -203,7 +203,7 @@ test("recall excludes recent current-session memory but keeps older and other-se
   store.matches = [recent, old, other].map((record, index) => ({ record, score: 0.9 - index * 0.1 }));
   const subject = engine([
     { query: "relevant facts" },
-    { relevantIds: ["recent", "old", "other"], instruction: "Apply relevant facts", reason: "Relevant" },
+    { relevantIds: ["recent", "old", "other"], reason: "Relevant" },
   ], store);
   const recalled = await subject.recall("current task");
   assert.deepEqual(recalled?.relevant.map((match) => match.record.id), ["old", "other"]);
@@ -315,7 +315,7 @@ test("recall removes frequency-limited memories before relevance judgment", asyn
   store.matches = [{ record: repeated, score: 0.95 }, { record: available, score: 0.9 }];
   const subject = engine([
     { query: "relevant facts" },
-    { relevantIds: ["repeated", "available"], instruction: "Use the available memory", reason: "Relevant" },
+    { relevantIds: ["repeated", "available"], reason: "Relevant" },
   ], store);
 
   const recalled = await subject.recall("current task", undefined, new Set(["repeated"]));
