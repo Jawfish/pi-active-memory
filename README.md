@@ -394,7 +394,7 @@ The editor exposes JSON fields for `text`, `kind`, `scope`, `projectId`, `confid
 | Command                          | Purpose                                                              |
 | -------------------------------- | -------------------------------------------------------------------- |
 | `/memory-status`                 | Provider/store health, counters, latest error and latest recall      |
-| `/memory-stats`                  | Current-session creates, recall attempts, steers, and feedback counts |
+| `/memory-stats`                  | Current-session memory counters and fast-model input/output tokens    |
 | `/memory`                        | Semantically find a memory, then edit or delete it                    |
 | `/memory-edit`                   | Semantically find and edit a memory's text or metadata                |
 | `/memory-list [global\|project]` | Inspect active memories and their IDs                                 |
@@ -404,6 +404,8 @@ The editor exposes JSON fields for `text`, `kind`, `scope`, `projectId`, `confid
 | `/memory-why`                    | Show IDs, scores, feedback token, and latest steer reason            |
 | `/memory-pause`                  | Pause automatic capture and recall for this session                  |
 | `/memory-resume`                 | Resume automation                                                    |
+
+Fast-model token totals include every provider response, including failed responses followed by fallback. LLM adapters that do not expose token usage show `N/A` instead of a misleading zero.
 
 ## Activity debug log
 

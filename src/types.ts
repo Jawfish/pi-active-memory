@@ -211,9 +211,15 @@ export interface ActiveMemoryConfig {
   activityLog: { enabled: boolean; includeText: boolean };
 }
 
+export interface FastModelTokenUsage {
+  input: number;
+  output: number;
+}
+
 export interface FastModelRunner {
   json<T>(system: string, prompt: string, signal?: AbortSignal): Promise<T>;
   selectedModel(): string | undefined;
+  onTokenUsage?(handler: (usage: FastModelTokenUsage) => void): void;
 }
 
 export interface ActiveMemoryAdapterContext {

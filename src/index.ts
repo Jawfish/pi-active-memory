@@ -17,7 +17,7 @@ import { SteerFeedbackLedger } from "./feedback.js";
 import { ActiveMemoryFooterStatus } from "./footer-status.js";
 import { MemoryEngine, rankMemoryMatches } from "./memory-engine.js";
 import { renderPrompt, structuredSteerMessage } from "./prompts.js";
-import { emptySessionStats, formatSessionStats, SESSION_STATS_ENTRY_TYPE, sessionStatsFromEntries, type SessionStatName } from "./session-stats.js";
+import { displayedSessionStats, emptySessionStats, formatSessionStats, SESSION_STATS_ENTRY_TYPE, sessionStatsFromEntries, type SessionStatName } from "./session-stats.js";
 import { activeMemoryStatus, compactionProgressStatus } from "./status.js";
 import { formatSteerSentence, orderedFeedbackOutcomes, type SteerFeedbackOutcome } from "./steer-display.js";
 import { MemorySteerLimiter } from "./steer-frequency.js";
@@ -29,6 +29,7 @@ interface Investigation { startedAt: number; cause: string; toolResults: number;
 const SUPPORTED_MEMORY_KINDS: MemoryKind[] = ["user_profile", "fact", "skill_workflow"];
 const STEER_TOOL_NAME = "memory_steer";
 const STEER_TOOL_PARAMETERS = Type.Object({ text: Type.String() });
+// SAFETY: ToolExecutionComponent only calls requestRender on this render-only TUI stub.
 const NOOP_TUI = { requestRender() {} } as unknown as TUI;
 const BUILT_IN_EMBEDDING_ADAPTERS = new Set(["openai", "openai-compatible", "ollama"]);
 const EMBEDDING_BATCH_SIZE = 64;
@@ -119,6 +120,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   let lastError: string | undefined;
   let capturedCount = 0;
   let sessionStats = emptySessionStats();
+  let fastModelTokenUsageAvailable = false;
   let investigation: Investigation | undefined;
   const dailySweepGate = new DailySweepGate();
   const footerStatus = new ActiveMemoryFooterStatus();
@@ -136,9 +138,10 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     }
   };
 
-  const incrementSessionStat = (name: SessionStatName): void => {
-    sessionStats[name]++;
-    pi.appendEntry(SESSION_STATS_ENTRY_TYPE, { name, amount: 1 });
+  const incrementSessionStat = (name: SessionStatName, amount = 1): void => {
+    if (!Number.isFinite(amount) || amount <= 0) return;
+    sessionStats[name] += amount;
+    pi.appendEntry(SESSION_STATS_ENTRY_TYPE, { name, amount });
   };
 
   pi.registerMessageRenderer<SteerDetails>("active-memory-steer", (message, options, theme) => {
@@ -187,7 +190,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     currentCwd = ctx.cwd;
     if (ctx.mode === "tui") footerStatus.install();
     const thisGeneration = ++generation;
-    paused = false; turns = 0; turnSequence = 0; toolResults = 0; thinkingCharacters = 0; lastError = undefined; investigation = undefined; initialRecallPrompt = undefined;
+    paused = false; turns = 0; turnSequence = 0; toolResults = 0; thinkingCharacters = 0; lastError = undefined; investigation = undefined; initialRecallPrompt = undefined; fastModelTokenUsageAvailable = false;
     config = await loadConfig(ctx.cwd, ctx.isProjectTrusted());
     if (BUILT_IN_EMBEDDING_ADAPTERS.has(config.providers.embedding.adapter)) {
       try {
@@ -253,6 +256,11 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       return;
     }
     const fast: FastModelRunner = await adapters.createLlm(config.providers.llm, adapterContext);
+    fastModelTokenUsageAvailable = typeof fast.onTokenUsage === "function";
+    fast.onTokenUsage?.(({ input, output }) => {
+      incrementSessionStat("fastModelInputTokens", input);
+      incrementSessionStat("fastModelOutputTokens", output);
+    });
     engine = new MemoryEngine(config, store, embedder, fast, projectId, ctx.sessionManager.getSessionId(), ctx.cwd, (type, data) => {
       activity?.log(type, data);
       if (type === "capture.stored" && typeof data === "object" && data !== null && (data as { created?: unknown }).created === true) {
@@ -682,14 +690,14 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     description: "Show active-memory health and configuration",
     handler: async (_args, ctx) => {
       const count = store ? (await store.list({ status: "active", kinds: SUPPORTED_MEMORY_KINDS }, 100000)).length : 0;
-      ctx.ui.notify(JSON.stringify({ state: paused ? "paused" : "active", projectId, memories: count, capturedThisSession: capturedCount, sessionStats, recallInFlight, activityLog: activity?.path, lastRecall, lastError, config: config && publicConfig(config) }, null, 2), lastError ? "warning" : "info");
+      ctx.ui.notify(JSON.stringify({ state: paused ? "paused" : "active", projectId, memories: count, capturedThisSession: capturedCount, sessionStats: displayedSessionStats(sessionStats, fastModelTokenUsageAvailable), recallInFlight, activityLog: activity?.path, lastRecall, lastError, config: config && publicConfig(config) }, null, 2), lastError ? "warning" : "info");
     },
   });
   pi.registerCommand("memory-stats", {
     description: "Show active-memory counters for the current session",
     handler: async (_args, ctx) => {
       await captureQueue.drain().catch(() => {});
-      ctx.ui.notify(formatSessionStats(sessionStats), "info");
+      ctx.ui.notify(formatSessionStats(sessionStats, fastModelTokenUsageAvailable), "info");
     },
   });
   pi.registerCommand("memory-settings", {
