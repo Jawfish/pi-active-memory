@@ -1,5 +1,10 @@
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
+import { join } from "node:path";
 import { Embedder, RoutedEmbedder } from "./embeddings.js";
+import { TransactionalVectorStoreError } from "./errors.js";
 import { PiFastModel } from "./fast-model.js";
+import { canonicalEndpoint } from "./embedding-metadata.js";
 import { JsonVectorStore } from "./stores/json-store.js";
 import { QdrantVectorStore } from "./stores/qdrant-store.js";
 import type {
@@ -28,7 +33,20 @@ export class AdapterRegistry implements ActiveMemoryAdapterRegistry {
   registerLlm(id: string, factory: ActiveMemoryAdapterFactory<FastModelRunner>): void { this.register("llm", this.llm, id, factory); }
 
   async createRag(selection: ActiveMemoryProvidersConfig["rag"], context: ActiveMemoryAdapterContext): Promise<VectorStore> {
-    return this.create("rag", this.rag, selection.adapter, selection.config, context);
+    const store = await this.create("rag", this.rag, selection.adapter, selection.config, context);
+    const required: Array<keyof VectorStore> = ["initialize", "get", "insert", "mutate", "compact", "scan", "rebuildVectors", "search", "list", "migrateLegacyProvenance", "close"];
+    let valid = false;
+    try { valid = Boolean(store && typeof store === "object" && store.contractVersion === 2 && required.every(method => typeof store[method] === "function")); }
+    catch { valid = false; }
+    if (!valid) {
+      try {
+        const resource = store && (typeof store === "object" || typeof store === "function") ? store as Partial<VectorStore> : undefined;
+        const close = resource?.close;
+        if (typeof close === "function") await close.call(store);
+      } catch {}
+      throw new TransactionalVectorStoreError();
+    }
+    return store;
   }
 
   async createEmbedding(selection: ActiveMemoryProvidersConfig["embedding"], context: ActiveMemoryAdapterContext): Promise<EmbeddingProvider> {
@@ -61,11 +79,15 @@ export class AdapterRegistry implements ActiveMemoryAdapterRegistry {
 export function createBuiltInAdapterRegistry(): AdapterRegistry {
   const registry = new AdapterRegistry();
   registry.registerRag("json", (config) => new JsonVectorStore(requiredString(config.path, "providers.rag.config.path")));
-  registry.registerRag("qdrant", (config) => new QdrantVectorStore(
-    requiredString(config.url, "providers.rag.config.url"),
-    requiredString(config.collection, "providers.rag.config.collection"),
-    optionalEnv(config.apiKeyEnv),
-  ));
+  registry.registerRag("qdrant", (config) => {
+    const url = requiredString(config.url, "providers.rag.config.url");
+    const collection = requiredString(config.collection, "providers.rag.config.collection");
+    // Coordination is part of canonical store identity. A configurable lock
+    // path would let two sessions targeting the same store bypass each other's
+    // transaction lock and ambiguous-publication fence.
+    const lockTarget = join(getAgentDir(), "active-memory", `qdrant-${createQdrantLockKey(url)}`);
+    return new QdrantVectorStore(url, collection, optionalEnv(config.apiKeyEnv), lockTarget);
+  });
 
   for (const provider of ["openai", "openai-compatible", "ollama"] as const) {
     registry.registerEmbedding(provider, async (config, context) => {
@@ -126,6 +148,10 @@ function stringArray(value: unknown, path: string): string[] {
 function thinking(value: unknown): FastModelConfig["thinking"] {
   if (value === "off" || value === "minimal" || value === "low" || value === "medium" || value === "high") return value;
   throw new Error("providers.llm.config.thinking is invalid");
+}
+
+function createQdrantLockKey(url: string): string {
+  return createHash("sha256").update(canonicalEndpoint(url)).digest("hex");
 }
 
 function optionalEnv(value: unknown): string | undefined {

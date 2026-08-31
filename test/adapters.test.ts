@@ -12,7 +12,13 @@ const context = {
 
 test("third-party factories can register and create each adapter component", async () => {
   const registry = new AdapterRegistry();
-  const rag = { initialize: async () => {}, close: async () => {} };
+  const rag = {
+    contractVersion: 2 as const,
+    initialize: async () => {}, get: async () => undefined, insert: async () => "inserted" as const,
+    mutate: async () => ({ status: "missing" as const }), compact: async () => { throw new Error("unused"); },
+    scan: async () => 0, rebuildVectors: async () => 0, search: async () => [], list: async () => [],
+    migrateLegacyProvenance: async () => 0, close: async () => {},
+  };
   const embedding = { model: "custom/embed", embed: async () => [[1, 0]] };
   const llm = { selectedModel: () => "custom/llm", json: async <T>() => ({ ok: true }) as T };
   registry.registerRag("custom-rag", (config, received) => {
@@ -26,6 +32,32 @@ test("third-party factories can register and create each adapter component", asy
   assert.equal(await registry.createRag({ adapter: "custom-rag", config: { endpoint: "memory://test" } }, context as never), rag);
   assert.equal(await registry.createEmbedding({ adapter: "custom-embedding", config: {} }, context as never), embedding);
   assert.equal(await registry.createLlm({ adapter: "custom-llm", config: {} }, context as never), llm);
+});
+
+test("legacy RAG adapters are closed and fail with the transactional v2 migration message", async () => {
+  const registry = new AdapterRegistry();
+  let closed = false;
+  registry.registerRag("legacy", () => ({ initialize: async () => {}, close: async () => { closed = true; } }) as never);
+  await assert.rejects(registry.createRag({ adapter: "legacy", config: {} }, context as never), /Transactional VectorStore v2 required/);
+  assert.equal(closed, true);
+});
+
+test("stores with throwing contract accessors are still closed", async () => {
+  const registry = new AdapterRegistry();
+  let closed = false;
+  const invalid = { get contractVersion(): never { throw new Error("PRIVATE_CONTRACT_ERROR"); }, close: async () => { closed = true; } };
+  registry.registerRag("throwing", () => invalid as never);
+  await assert.rejects(registry.createRag({ adapter: "throwing", config: {} }, context as never), /Transactional VectorStore v2 required/);
+  assert.equal(closed, true);
+});
+
+test("invalid callable stores are closed before rejection", async () => {
+  const registry = new AdapterRegistry();
+  let closed = false;
+  const invalid = Object.assign(() => {}, { close: async () => { closed = true; } });
+  registry.registerRag("callable", () => invalid as never);
+  await assert.rejects(registry.createRag({ adapter: "callable", config: {} }, context as never), /Transactional VectorStore v2 required/);
+  assert.equal(closed, true);
 });
 
 test("adapter registration rejects duplicate ids and unknown selections", async () => {
@@ -47,6 +79,15 @@ test("built-in registry exposes independent rag, embedding, and llm adapters", a
   assert.equal(typeof rag.search, "function");
   assert.deepEqual(embeddingModels(embedding), { query: "ollama/embed", document: "ollama/embed" });
   assert.equal(llm.selectedModel(), undefined);
+});
+
+test("Qdrant coordination cannot be split by configuration", async () => {
+  const registry = createBuiltInAdapterRegistry();
+  const first = await registry.createRag({ adapter: "qdrant", config: { url: "HTTP://QDRANT:80/", collection: "mem", lockPath: "/tmp/private-a" } }, context as never) as unknown as { lockPath: string; fencePath: string };
+  const second = await registry.createRag({ adapter: "qdrant", config: { url: "http://qdrant", collection: "mem", lockPath: "/tmp/private-b" } }, context as never) as unknown as { lockPath: string; fencePath: string };
+  assert.equal(first.lockPath, second.lockPath);
+  assert.equal(first.fencePath, second.fencePath);
+  assert.doesNotMatch(first.lockPath, /private-[ab]/);
 });
 
 test("embedding configuration requires unified or complete separate models", () => {

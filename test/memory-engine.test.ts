@@ -5,26 +5,30 @@ import { isRecentCurrentSessionMemory, MemoryEngine, rankMemoryMatches } from ".
 import type { EmbeddingProvider, FastModelRunner, MemoryFilter, MemoryMatch, MemoryRecord, VectorStore } from "../src/types.js";
 
 class Store implements VectorStore {
+  readonly contractVersion = 2 as const;
   records: MemoryRecord[] = [];
   matches: MemoryMatch[] = [];
   lastSearchVector?: number[];
   lastUpsertVector?: number[];
+  beforeMutate?: (id: string) => void;
   async initialize(): Promise<void> {}
-  async upsert(record: MemoryRecord, vector: number[]): Promise<void> {
-    this.lastUpsertVector = vector;
-    const index = this.records.findIndex((candidate) => candidate.id === record.id);
-    if (index >= 0) this.records[index] = record;
-    else this.records.push(record);
+  async get(id: string): Promise<MemoryRecord | undefined> { return this.records.find(record => record.id === id); }
+  async insert(row: { record: MemoryRecord; vector: number[] }): Promise<"inserted" | "exists"> { if (await this.get(row.record.id)) return "exists"; this.lastUpsertVector = row.vector; this.records.push(row.record); return "inserted"; }
+  async mutate(id: string, apply: (latest: Readonly<MemoryRecord>) => { record: MemoryRecord; vector?: number[] } | undefined) {
+    this.beforeMutate?.(id);
+    const index = this.records.findIndex(record => record.id === id);
+    if (index < 0) return { status: "missing" as const };
+    const result = apply(this.records[index]!);
+    if (!result) return { status: "unchanged" as const, record: this.records[index]! };
+    this.records[index] = result.record;
+    if (result.vector) this.lastUpsertVector = result.vector;
+    return { status: "updated" as const, record: result.record };
   }
-  async update(record: MemoryRecord): Promise<boolean> {
-    const index = this.records.findIndex((candidate) => candidate.id === record.id);
-    if (index < 0) return false;
-    this.records[index] = record;
-    return true;
-  }
+  async compact(sourceIds: readonly string[], build: (latest: readonly MemoryRecord[]) => { record: MemoryRecord; vector: number[] }): Promise<MemoryRecord> { const sources = this.records.filter(record => sourceIds.includes(record.id)); const row = build(sources); this.records = this.records.map(record => sourceIds.includes(record.id) ? { ...record, status: "superseded" as const } : record); this.records.push(row.record); this.lastUpsertVector = row.vector; return row.record; }
+  async scan(_filter: MemoryFilter, visit: (page: readonly MemoryRecord[]) => Promise<void>): Promise<number> { await visit(this.records); return this.records.length; }
+  async rebuildVectors(_dimension: number, buildPage: (page: readonly MemoryRecord[]) => Promise<readonly { record: MemoryRecord; vector: number[] }[]>): Promise<number> { const rows = await buildPage(this.records); this.records = rows.map(row => row.record); return rows.length; }
   async search(vector: number[], _filter: MemoryFilter, _limit: number): Promise<MemoryMatch[]> { this.lastSearchVector = vector; return this.matches; }
   async list(): Promise<MemoryRecord[]> { return this.records; }
-  async markDeleted(): Promise<boolean> { return false; }
   async migrateLegacyProvenance(): Promise<number> { return 0; }
   async close(): Promise<void> {}
 }
@@ -41,6 +45,13 @@ const embedder = { model: "test/embed", embed: async (texts: string[]) => texts.
 function engine(response: unknown | unknown[], store: Store, embedding: EmbeddingProvider = embedder): MemoryEngine {
   return new MemoryEngine(DEFAULT_CONFIG, store, embedding, new Fast(Array.isArray(response) ? response : [response]), "project", "session", "/cwd");
 }
+
+test("activity events never persist adapter-reported model identifiers", async () => {
+  const events: unknown[] = [];
+  const subject = new MemoryEngine(DEFAULT_CONFIG, new Store(), embedder, new Fast([{ memories: [] }]), "project", "session", "/cwd", (_event, data) => events.push(data));
+  await subject.capture("This message is deliberately long enough to run extraction.", "context");
+  assert.doesNotMatch(JSON.stringify(events), /test\/fast/);
+});
 
 test("capture rejects a candidate sourced only from assistant context", async () => {
   const store = new Store();
@@ -118,6 +129,7 @@ test("assistant capture is time-gated and stores lower-priority provenance", asy
 test("assistant candidate searches first and updates an assistant memory", async () => {
   const store = new Store();
   const existing = { ...memory("existing", "older-session", "2020-01-01T00:00:00Z"), source: { actor: "assistant" as const, sessionId: "older-session", cwd: "/cwd", cause: "old investigation", reason: "hard to find" }, priority: 0.55 };
+  store.records = [existing];
   store.matches = [{ record: existing, score: 0.95 }];
   const subject = engine([
     { memories: [{ text: "The parser registry is in src/parser-registry.ts.", kind: "fact", scope: "global", confidence: 0.7, evidence: "parser registry moved to src/parser-registry.ts", whyStored: "Locating the move required tracing generated imports." }] },
@@ -155,6 +167,23 @@ test("assistant memory correction replaces text and preserves provenance", async
   assert.equal(store.records[0]?.text, corrected.text);
 });
 
+test("assistant correction cannot follow a record into another project", async () => {
+  const store = new Store();
+  const existing = {
+    ...memory("assistant-memory", "older-session", "2020-01-01T00:00:00Z"),
+    text: "Old assistant claim.",
+    source: { actor: "assistant" as const, sessionId: "older-session", cwd: "/old", cause: "old investigation", reason: "old trace" },
+  };
+  store.records = [existing];
+  store.beforeMutate = () => { store.records[0] = { ...store.records[0]!, scope: "project", projectId: "other-project" }; };
+  await assert.rejects(
+    engine({}, store).correctAssistantMemory(existing.id, "Corrected assistant claim.", "The old claim is wrong."),
+    /changed while correction was being prepared/,
+  );
+  assert.equal(store.records[0]?.text, "Old assistant claim.");
+  assert.equal(store.records[0]?.projectId, "other-project");
+});
+
 test("assistant memory correction cannot alter user-sourced memory", async () => {
   const store = new Store();
   store.records = [memory("user-memory", "older-session", "2020-01-01T00:00:00Z")];
@@ -181,6 +210,63 @@ test("assistant candidate cannot overwrite a user-sourced memory", async () => {
 function memory(id: string, sourceSession: string, createdAt: string): MemoryRecord {
   return { id, text: id, kind: "fact", scope: "global", confidence: 1, status: "active", source: { actor: "user", sessionId: sourceSession, cwd: "/cwd", cause: "test", reason: "test fixture" }, createdAt, updatedAt: createdAt, embeddingModel: "test", schemaVersion: 1 };
 }
+
+test("a user statement can replace a reviewed assistant memory with user authority", async () => {
+  const store = new Store();
+  const existing = {
+    ...memory("assistant-memory", "older-session", "2020-01-01T00:00:00Z"),
+    text: "Use yarn for this project.",
+    source: { actor: "assistant" as const, sessionId: "older-session", cwd: "/cwd", cause: "investigation", reason: "inferred package manager" },
+    priority: DEFAULT_CONFIG.assistantCapture.priority,
+  };
+  store.records = [existing];
+  store.matches = [{ record: existing, score: 0.95 }];
+  const subject = engine([
+    { memories: [{ text: "Use pnpm for this project.", kind: "fact", scope: "global", confidence: 0.99, evidence: "Use pnpm for this project" }] },
+    { accept: true, reason: "Explicit user correction" },
+    { action: "replace", targetId: "assistant-memory", text: "Use pnpm for this project." },
+  ], store);
+  assert.equal(await subject.capture("Use pnpm for this project.", ""), 1);
+  assert.equal(store.records[0]?.source.actor, "user");
+  assert.equal(store.records[0]?.priority, 1);
+  assert.equal(store.records[0]?.text, "Use pnpm for this project.");
+});
+
+test("replacement may change a reviewed memory kind", async () => {
+  const store = new Store();
+  const existing = { ...memory("workflow", "older-session", "2020-01-01T00:00:00Z"), kind: "fact" as const, text: "Run the formatter manually." };
+  store.records = [existing];
+  store.matches = [{ record: existing, score: 0.95 }];
+  const subject = engine([
+    { memories: [{ text: "Use the formatter before every commit.", kind: "skill_workflow", scope: "global", confidence: 0.99, evidence: "Use the formatter before every commit" }] },
+    { accept: true, reason: "Explicit durable workflow" },
+    { action: "replace", targetId: "workflow", text: "Use the formatter before every commit." },
+  ], store);
+  assert.equal(await subject.capture("Use the formatter before every commit.", ""), 1);
+  assert.equal(store.records[0]?.kind, "skill_workflow");
+});
+
+test("replacement conflicts are re-resolved instead of silently losing capture", async () => {
+  const store = new Store();
+  const existing = memory("existing", "older-session", "2020-01-01T00:00:00Z");
+  store.records = [existing];
+  store.matches = [{ record: existing, score: 0.95 }];
+  store.beforeMutate = () => {
+    store.beforeMutate = undefined;
+    const changed = { ...existing, text: "concurrently changed", updatedAt: "2026-01-02T00:00:00Z" };
+    store.records = [changed];
+    store.matches = [{ record: changed, score: 0.95 }];
+  };
+  const subject = engine([
+    { memories: [{ text: "The durable value is new.", kind: "fact", scope: "global", confidence: 0.99, evidence: "durable value is new" }] },
+    { accept: true, reason: "Explicit durable fact" },
+    { action: "replace", targetId: "existing", text: "The durable value is new." },
+    { action: "add", text: "The durable value is new." },
+  ], store);
+  assert.equal(await subject.capture("The durable value is new.", ""), 1);
+  assert.equal(store.records.length, 2);
+  assert.ok(store.records.some(item => item.text === "The durable value is new."));
+});
 
 test("ranking lowers assistant memories by confidence and priority", () => {
   const user = memory("user", "old", "2020-01-01T00:00:00Z");
@@ -210,6 +296,19 @@ test("recall uses query embeddings while stored memories use document embeddings
   ], store, dual).capture("The project uses a generated cache.", "");
   assert.deepEqual(store.lastUpsertVector, [0, 1]);
   assert.equal(store.records.at(-1)?.embeddingModel, "test/document");
+});
+
+test("recall relevance is reinforced only after delivery is recorded", async () => {
+  const store = new Store();
+  const existing = memory("delivered", "older-session", "2020-01-01T00:00:00Z");
+  store.records = [existing];
+  store.matches = [{ record: existing, score: 0.9 }];
+  const subject = engine([{ query: "durable" }, { relevantIds: ["delivered"], reason: "relevant" }], store);
+  const recalled = await subject.recall("Need the durable fact", undefined, new Set(), "unrelated context");
+  assert.ok(recalled);
+  assert.equal(store.records[0]?.lifecycle?.reinforcementCount ?? 0, 0);
+  await subject.recordRecallDelivery(recalled!.relevant.map(match => match.record));
+  assert.equal(store.records[0]?.lifecycle?.reinforcementCount, 1);
 });
 
 test("recent-memory filter suppresses only young memories from the current session", () => {

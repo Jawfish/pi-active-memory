@@ -19,25 +19,35 @@ user/long investigation ──► fast validation model ──► embeddings ─
 - Searches for related memories before every automatic or explicit write, then chooses add, update, or no-op. Assistant findings cannot overwrite user-sourced claims.
 - New memories start at neutral usefulness confidence. Bounded, steer-bound `memory_feedback` raises or lowers future ranking while preventing duplicate and runaway reinforcement.
 - Assistant findings retain lower ranking priority than user-caused memories.
-- Memories expire by elapsed time, inactive-session count, or very low confidence. Relevant recall and useful feedback extend both expiry budgets; expiry is a recoverable soft deletion with an audit reason.
+- Memories use UTC-day confidence decay and are soft-deleted when confidence reaches the configured threshold. The default decay rate is unchanged (0.28, approximately five unused UTC days to cross the default deletion threshold); inactive-session expiry is not implemented.
 - User-only `/memory-compact` reviews one related pair at a time before consolidating it; it never merges across scope, kind, project, or user/assistant authority.
 - Supports global and project-scoped memories through metadata filters.
-- Recalls before a new agent run and periodically during longer tool/reasoning loops.
+- Run-start recall is queued background work and can affect a subsequent model request; later recall is coalesced during longer tool/reasoning loops.
 - Uses clearly labelled Pi custom messages containing selected memories verbatim, with compact feedback instructions.
 - Rejects current-task state, progress, next steps, TODOs, one-off requests, and unrelated project activity.
 - Exposes `memory_search` for deliberate manual lookup, while telling the agent not to search redundantly because background recall is active.
-- Soft-deletes memories for recoverability and retains the source user message and exact evidence quote.
+- Soft-deletes retain audit data and provenance, but this release does not provide a restore command.
 - Redacts common secrets before persistence.
 
 Influenced by the strongest ideas in `pi-hermes-memory`, `pi-semantic-memory`, `pi-memory`, and the observational-memory extensions: activity-based capture, local namespaces, background job coalescing, provenance, soft deletion, and cache-stable injection.
 
 ## Install
 
-Install from [npm](https://www.npmjs.com/package/pi-active-memory):
+Install a released package from [npm](https://www.npmjs.com/package/pi-active-memory):
 
 ```bash
 pi install npm:pi-active-memory
 ```
+
+This Jawfish fork targets Node.js **>=22.19.0**. It has CI but deliberately disables semantic-release and npm publishing; upstream package publishing is not performed from this fork.
+
+## Storage integrity and adapter migration
+
+JSON storage fails closed: malformed or structurally invalid files are never treated as empty and are not rewritten. Pi processes sharing the agent directory use an advisory lock and atomic file publication for mutations.
+
+RAG adapters must implement the transactional `VectorStore` v2 contract (`contractVersion: 2`, `insert`, `mutate`, `compact`, `scan`, and `rebuildVectors`). Legacy RAG adapters fail startup with an actionable migration error rather than running unsafely. `mutate` must reload the latest row under the adapter write coordinator, and text/model changes must commit a replacement vector together with the payload. Embedding and LLM adapter contracts are unchanged.
+
+Qdrant vector rebuilds stage the replacement collection before attempting an alias swap, so an upload failure leaves the current collection available. Local coordination cannot serialize out-of-band or unrelated-host Qdrant writers.
 
 ## Default providers
 
@@ -345,7 +355,7 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
-The registration listener is installed by the adapter extension factory. Active Memory emits discovery during `session_start`, after all extension factories have loaded. Select it with `providers.embedding.adapter: "my-embedding"`. The same registry exposes `registerRag` and `registerLlm`. Adapter configuration is passed through untouched.
+The registration listener is installed by the adapter extension factory. Active Memory emits discovery during `session_start`, after all extension factories have loaded. Select it with `providers.embedding.adapter: "my-embedding"`. The same registry exposes `registerRag` and `registerLlm`. Adapter configuration is passed through untouched. A custom RAG selection must include a stable, non-secret `config.storeIdentity` that identifies its backing vector data and remains unchanged when credentials or tuning change; Active Memory uses it for cross-session embedding-generation fencing.
 
 ## Memory eligibility
 
@@ -472,16 +482,7 @@ The extension is TypeScript loaded directly by Pi through its package manifest; 
 
 ## Releasing
 
-Releases use Conventional Commits and semantic-release on every push to `master`:
-
-| Commit                                      | Release         |
-| ------------------------------------------- | --------------- |
-| `fix: ...`                                  | patch           |
-| `feat: ...`                                 | minor           |
-| `feat!: ...` or a `BREAKING CHANGE:` footer | major           |
-| `docs:`, `test:`, `chore:`, `refactor:`     | none by default |
-
-A release updates `package.json`, `package-lock.json`, and `CHANGELOG.md`, then creates a Git tag and GitHub release. It does not publish to npm.
+Automated release and npm-publishing machinery is intentionally removed from this personal fork. Pushes and pull requests run CI only. Any future distribution should first use a distinct package name and an explicitly reviewed release workflow.
 
 ## License
 

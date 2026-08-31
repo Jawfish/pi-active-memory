@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, loadConfig, saveUserCompactionThreshold, saveUserMemoryLifecycle } from "../src/config.js";
+import { DEFAULT_CONFIG, loadConfig, publicConfig, saveUserCompactionThreshold, saveUserMemoryLifecycle, saveUserMemoryLifecycleSetting } from "../src/config.js";
 
 test("user compaction setting preserves unrelated extension configuration", async () => {
   const directory = await mkdtemp(join(tmpdir(), "active-memory-config-"));
@@ -40,6 +40,86 @@ test("grouped memory lifecycle settings persist without clobbering other configu
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("lifecycle leaf saves validate prospective inherited bounds", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "active-memory-prospective-config-"));
+  const path = join(directory, "active-memory.json");
+  try {
+    await writeFile(path, JSON.stringify({ memoryLifecycle: { decay: { minimumRate: 0.2 } } }));
+    await assert.rejects(saveUserMemoryLifecycleSetting("decay.initialRate", 0.1, path), /inconsistent/);
+    assert.equal(JSON.parse(await readFile(path, "utf8")).memoryLifecycle.decay.minimumRate, 0.2);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("effective code and project bounds reject an invalid user leaf before persistence", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "active-memory-effective-save-"));
+  const cwd = join(directory, "project");
+  const agentDir = join(directory, "agent");
+  const path = join(agentDir, "active-memory.json");
+  try {
+    await mkdir(cwd, { recursive: true });
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(join(agentDir, "active-memory.config.ts"), "export default { memoryLifecycle: { decay: { minimumRate: 0.2 } } };");
+    const effective = await loadConfig(cwd, false, agentDir);
+    await assert.rejects(saveUserMemoryLifecycleSetting("decay.initialRate", 0.1, path, effective), /inconsistent/);
+    await assert.rejects(readFile(path, "utf8"), /ENOENT/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("settings saves validate the effective layered policy rather than an incomplete global layer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "active-memory-layered-save-"));
+  const path = join(directory, "active-memory.json");
+  const effective = structuredClone(DEFAULT_CONFIG);
+  effective.memoryLifecycle.decay.minimumRate = 0.4;
+  effective.memoryLifecycle.decay.initialRate = 0.5;
+  try {
+    await writeFile(path, JSON.stringify({ memoryLifecycle: { decay: { minimumRate: 0.4 } } }));
+    await saveUserCompactionThreshold(0.6, path, effective);
+    await saveUserMemoryLifecycleSetting("decay.initialRate", 0.6, path, effective);
+    const saved = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(saved.compaction.similarityThreshold, 0.6);
+    assert.equal(saved.memoryLifecycle.decay.minimumRate, 0.4);
+    assert.equal(saved.memoryLifecycle.decay.initialRate, 0.6);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("invalid roots and semantic ranges fail closed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "active-memory-invalid-config-"));
+  const cwd = join(directory, "project");
+  const agentDir = join(directory, "agent");
+  try {
+    await mkdir(cwd, { recursive: true });
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(join(agentDir, "active-memory.json"), "[]");
+    await assert.rejects(loadConfig(cwd, false, agentDir), /layer must be an object/);
+    await writeFile(join(agentDir, "active-memory.json"), JSON.stringify({ recall: { topK: 0 }, memoryLifecycle: { feedback: { historyLimit: -1 } } }));
+    await assert.rejects(loadConfig(cwd, false, agentDir), /sizes and cadences/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("concurrent user leaf saves preserve both updates", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "active-memory-concurrent-config-"));
+  const path = join(directory, "active-memory.json");
+  try {
+    await Promise.all([
+      saveUserCompactionThreshold(0.7, path),
+      saveUserMemoryLifecycleSetting("decay.initialRate", 0.2, path),
+    ]);
+    const saved = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(saved.compaction.similarityThreshold, 0.7);
+    assert.equal(saved.memoryLifecycle.decay.initialRate, 0.2);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("public configuration omits prompts and opaque provider values", () => {
+  const config = structuredClone(DEFAULT_CONFIG);
+  config.prompts.query = "secret prompt";
+  config.providers.rag.config = { token: "secret adapter value" };
+  const visible = publicConfig(config) as Record<string, unknown>;
+  assert.equal(Object.hasOwn(visible, "prompts"), false);
+  assert.deepEqual(visible.providers, { rag: { configured: true }, embedding: { configured: true }, llm: { configured: true } });
+  assert.doesNotMatch(JSON.stringify(visible), /secret/);
 });
 
 test("prompt templates can be overridden individually without losing defaults", async () => {

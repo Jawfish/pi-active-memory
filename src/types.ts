@@ -66,15 +66,29 @@ export interface MemoryRecord {
 export interface MemoryMatch { record: MemoryRecord; score: number }
 export interface MemoryFilter { scopes?: MemoryScope[]; kinds?: MemoryKind[]; projectId?: string; status?: MemoryRecord["status"] }
 
+export interface VectorRow { record: MemoryRecord; vector: number[] }
+
+export interface MutationResult {
+  status: "missing" | "unchanged" | "updated";
+  record?: MemoryRecord;
+}
+
+/**
+ * Transactional vector storage contract. Implementations must serialize `mutate`,
+ * `compact`, and `rebuildVectors` against other writers and commit text/payload
+ * changes together with their corresponding vector.
+ */
 export interface VectorStore {
+  readonly contractVersion: 2;
   initialize(dimension?: number): Promise<void>;
-  upsert(record: MemoryRecord, vector: number[]): Promise<void>;
-  update(record: MemoryRecord): Promise<boolean>;
+  get(id: string): Promise<MemoryRecord | undefined>;
+  insert(row: VectorRow): Promise<"inserted" | "exists">;
+  mutate(id: string, apply: (latest: Readonly<MemoryRecord>) => { record: MemoryRecord; vector?: number[] } | undefined): Promise<MutationResult>;
+  compact(sourceIds: readonly string[], build: (latest: readonly MemoryRecord[]) => VectorRow): Promise<MemoryRecord>;
+  scan(filter: MemoryFilter, visit: (page: readonly MemoryRecord[]) => Promise<void>, pageSize?: number): Promise<number>;
+  rebuildVectors(dimension: number, buildPage: (page: readonly MemoryRecord[]) => Promise<readonly VectorRow[]>): Promise<number>;
   search(vector: number[], filter: MemoryFilter, limit: number): Promise<MemoryMatch[]>;
   list(filter: MemoryFilter, limit: number): Promise<MemoryRecord[]>;
-  listAll?(): Promise<MemoryRecord[]>;
-  replaceAll?(rows: Array<{ record: MemoryRecord; vector: number[] }>): Promise<void>;
-  markDeleted(id: string): Promise<boolean>;
   migrateLegacyProvenance(): Promise<number>;
   close(): Promise<void>;
 }

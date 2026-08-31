@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { boundedAssistantInvestigation, cosineSimilarity, evidenceAppearsInUserMessage, isTransientTaskMemory, parseJsonResponse, redactSecrets, sourceEvidenceAppearsInContext, stableProjectId } from "../src/utils.js";
+import { boundedAssistantInvestigation, cosineSimilarity, evidenceAppearsInUserMessage, isTransientTaskMemory, parseJsonResponse, redactSecrets, sanitizePersistedText, sourceEvidenceAppearsInContext, stableProjectId } from "../src/utils.js";
 
 test("cosine similarity ranks identical vectors", () => {
   assert.equal(cosineSimilarity([1, 0], [1, 0]), 1);
@@ -14,6 +14,13 @@ test("parses fenced model JSON", () => {
 test("redacts common secrets", () => {
   assert.doesNotMatch(redactSecrets("api_key=abcdefghijklmno"), /abcdefghijklmno/);
   assert.doesNotMatch(redactSecrets("ghp_abcdefghijklmnopqrstuvwxyz"), /ghp_/);
+});
+
+test("persisted text is redacted before truncation and rejects multiple lines", () => {
+  const sanitized = sanitizePersistedText(`note sk-${"A".repeat(40)}`, 18, true);
+  assert.doesNotMatch(sanitized, /sk-/);
+  assert.match(sanitized, /REDACTED/);
+  assert.throws(() => sanitizePersistedText("line one\nline two", 100, true), /one non-empty line/);
 });
 
 test("assistant investigation context excludes user messages", () => {

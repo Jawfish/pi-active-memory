@@ -33,6 +33,15 @@ test("deferred queue runs work serially", async () => {
   assert.deepEqual(events, ["first:start", "first:end", "second"]);
 });
 
+test("aborted queued jobs still run cancellation cleanup", async () => {
+  const queue = new DeferredSerialQueue();
+  let cleanup = false;
+  queue.enqueue(async signal => { if (signal.aborted) cleanup = true; });
+  queue.abort("pause");
+  await queue.drain();
+  assert.equal(cleanup, true);
+});
+
 test("deferred queue continues after a failed job", async () => {
   const queue = new DeferredSerialQueue();
   const events: string[] = [];

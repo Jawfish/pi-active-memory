@@ -12,9 +12,13 @@ function sourceIsComplete(source: Partial<MemorySource> | undefined): boolean {
 }
 
 export function hasCompleteProvenance(record: MemoryRecord): boolean {
-  return sourceIsComplete(record.source as Partial<MemorySource> | undefined) &&
+  const supersedes = record.supersedes ?? [];
+  return record.schemaVersion === 2 &&
+    sourceIsComplete(record.source as Partial<MemorySource> | undefined) &&
     (record.sourceHistory ?? []).every((source) => sourceIsComplete(source)) &&
-    Number.isFinite(record.priority);
+    Number.isFinite(record.priority) &&
+    !supersedes.includes(record.id) &&
+    new Set(supersedes).size === supersedes.length;
 }
 
 function normalizeSource(value: Partial<MemorySource> | undefined): MemorySource {
@@ -35,10 +39,12 @@ function normalizeSource(value: Partial<MemorySource> | undefined): MemorySource
 /** Upgrade records created before actor/cause/rationale were mandatory. */
 export function normalizeProvenance(record: MemoryRecord): MemoryRecord {
   const source = normalizeSource(record.source as Partial<MemorySource> | undefined);
+  const supersedes = record.supersedes ? [...new Set(record.supersedes.filter(id => id !== record.id))] : undefined;
   return {
     ...record,
     source,
     ...(record.sourceHistory ? { sourceHistory: record.sourceHistory.map((item) => normalizeSource(item)) } : {}),
+    ...(supersedes ? { supersedes } : {}),
     priority: Number.isFinite(record.priority) ? record.priority : source.actor === "assistant" ? 0.55 : 1,
     schemaVersion: 2,
   };

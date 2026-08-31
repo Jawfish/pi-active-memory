@@ -1,9 +1,10 @@
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
 import { createJiti } from "jiti";
 import { DEFAULT_PROMPTS } from "./prompts.js";
 import type { ActiveMemoryConfig } from "./types.js";
+import { atomicWriteFile, withStorageLock } from "./storage-lock.js";
 
 export const DEFAULT_CONFIG: ActiveMemoryConfig = {
   enabled: true,
@@ -74,20 +75,45 @@ function merge<T>(base: T, patch: unknown): T {
   return out as T;
 }
 
+export class ActiveMemoryConfigError extends Error {
+  constructor(message: string, readonly configPath?: string) { super(message); this.name = "ActiveMemoryConfigError"; }
+}
+
 async function readJson(path: string): Promise<unknown> {
-  try { return JSON.parse(await readFile(path, "utf8")); } catch { return undefined; }
+  let text: string;
+  try { text = await readFile(path, "utf8"); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw new ActiveMemoryConfigError("Could not read Active Memory configuration", path); }
+  try { return JSON.parse(text); } catch { throw new ActiveMemoryConfigError("Active Memory configuration contains invalid JSON", path); }
 }
 
 export async function saveUserCompactionThreshold(
   similarityThreshold: number,
   path = join(homedir(), ".pi", "agent", "active-memory.json"),
+  effectiveConfig?: ActiveMemoryConfig,
 ): Promise<void> {
   if (!Number.isFinite(similarityThreshold) || similarityThreshold < 0 || similarityThreshold > 1) {
     throw new Error("Compaction similarity threshold must be between 0 and 1");
   }
-  await saveUserConfigPatch({ compaction: { similarityThreshold } }, path);
+  await saveUserConfigPatch({ compaction: { similarityThreshold } }, path, effectiveConfig);
 }
 
+export type UserLifecycleSetting = "decay.initialRate" | "confidence.deletionThreshold";
+
+/** Persist only a user-selected lifecycle leaf, never the merged project-effective policy. */
+export async function saveUserMemoryLifecycleSetting(
+  setting: UserLifecycleSetting,
+  value: number,
+  path = join(homedir(), ".pi", "agent", "active-memory.json"),
+  effectiveConfig?: ActiveMemoryConfig,
+): Promise<void> {
+  if (!Number.isFinite(value) || value < 0 || value > 1) throw new Error("Memory lifecycle setting must be between 0 and 1");
+  const patch = setting === "decay.initialRate"
+    ? { memoryLifecycle: { decay: { initialRate: value } } }
+    : { memoryLifecycle: { confidence: { deletionThreshold: value } } };
+  await saveUserConfigPatch(patch, path, effectiveConfig);
+}
+
+/** @deprecated Use saveUserMemoryLifecycleSetting to avoid persisting merged config. */
 export async function saveUserMemoryLifecycle(
   memoryLifecycle: ActiveMemoryConfig["memoryLifecycle"],
   path = join(homedir(), ".pi", "agent", "active-memory.json"),
@@ -95,14 +121,21 @@ export async function saveUserMemoryLifecycle(
   await saveUserConfigPatch({ memoryLifecycle }, path);
 }
 
-async function saveUserConfigPatch(patch: JsonObject, path: string): Promise<void> {
-  const existing = await readJson(path);
-  const root = existing && typeof existing === "object" && !Array.isArray(existing) ? existing as JsonObject : {};
-  const next = merge(root, patch);
-  await mkdir(dirname(path), { recursive: true });
-  const temporary = `${path}.tmp`;
-  await writeFile(temporary, JSON.stringify(next, null, 2), { encoding: "utf8", mode: 0o600 });
-  await rename(temporary, path);
+async function saveUserConfigPatch(patch: JsonObject, path: string, effectiveConfig?: ActiveMemoryConfig): Promise<void> {
+  await withStorageLock(path, async () => {
+    const existing = await readJson(path);
+    if (existing !== undefined && (!existing || typeof existing !== "object" || Array.isArray(existing))) throw new ActiveMemoryConfigError("Active Memory configuration root must be an object", path);
+    const root = existing as JsonObject | undefined ?? {};
+    const next = merge(root, patch);
+    // A global JSON layer can be intentionally incomplete until later code or
+    // project overlays are applied. Validate against the caller's effective
+    // layered policy when available, while still persisting only the user leaf.
+    const prospective = effectiveConfig
+      ? merge(structuredClone(effectiveConfig), patch)
+      : merge(DEFAULT_CONFIG, migrateConfig(next));
+    validateMergedConfig(prospective);
+    await atomicWriteFile(path, JSON.stringify(next, null, 2));
+  });
 }
 
 export interface ActiveMemoryCodeConfigContext {
@@ -117,17 +150,20 @@ export async function loadConfig(
   agentDir = join(homedir(), ".pi", "agent"),
 ): Promise<ActiveMemoryConfig> {
   const context: ActiveMemoryCodeConfigContext = { cwd, projectTrusted, defaults: structuredClone(DEFAULT_CONFIG) };
-  let config = merge(DEFAULT_CONFIG, migrateConfig(await readJson(join(agentDir, "active-memory.json"))));
-  config = merge(config, migrateConfig(await readCodeConfig(agentDir, "active-memory.config", context)));
+  const globalJsonPath = join(agentDir, "active-memory.json");
+  const globalCodePath = join(agentDir, "active-memory.config");
+  let config = merge(DEFAULT_CONFIG, migrateConfig(configLayer(await readJson(globalJsonPath), globalJsonPath)));
+  config = merge(config, migrateConfig(configLayer(await readCodeConfig(agentDir, "active-memory.config", context), globalCodePath)));
   if (projectTrusted) {
-    config = merge(config, migrateConfig(await readJson(join(cwd, ".pi", "active-memory.json"))));
-    config = merge(config, migrateConfig(await readCodeConfig(join(cwd, ".pi"), "active-memory.config", context)));
+    const projectJsonPath = join(cwd, ".pi", "active-memory.json");
+    const projectCodePath = join(cwd, ".pi", "active-memory.config");
+    config = merge(config, migrateConfig(configLayer(await readJson(projectJsonPath), projectJsonPath)));
+    config = merge(config, migrateConfig(configLayer(await readCodeConfig(join(cwd, ".pi"), "active-memory.config", context), projectCodePath)));
   }
-  const rag = config.providers.rag;
-  if (rag.adapter === "json" && typeof rag.config.path === "string") {
-    rag.config.path = resolve(rag.config.path.replace(/^~(?=\/)/, homedir()));
-  }
-  return config;
+  const validated = validateMergedConfig(config);
+  const rag = validated.providers.rag;
+  if (rag.adapter === "json" && typeof rag.config.path === "string") rag.config.path = resolve(rag.config.path.replace(/^~(?=\/)/, homedir()));
+  return validated;
 }
 
 async function readCodeConfig(directory: string, basename: string, context: ActiveMemoryCodeConfigContext): Promise<unknown> {
@@ -135,8 +171,9 @@ async function readCodeConfig(directory: string, basename: string, context: Acti
     const path = join(directory, `${basename}${extension}`);
     try {
       await readFile(path, "utf8");
-    } catch {
-      continue;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw new ActiveMemoryConfigError("Could not read Active Memory code configuration", path);
     }
     const jiti = createJiti(import.meta.url, { moduleCache: false });
     const loaded = await jiti.import(path, { default: true }) as unknown;
@@ -145,6 +182,12 @@ async function readCodeConfig(directory: string, basename: string, context: Acti
       : loaded;
   }
   return undefined;
+}
+
+function configLayer(value: unknown, path: string): unknown {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new ActiveMemoryConfigError("Active Memory configuration layer must be an object", path);
+  return value;
 }
 
 function migrateConfig(value: unknown): unknown {
@@ -195,6 +238,46 @@ function migrateLifecycleConfig(value: unknown): unknown {
   return { ...rest, memoryLifecycle: lifecycle };
 }
 
-export function publicConfig(config: ActiveMemoryConfig): object {
+/** Safe status/log projection: custom adapter configuration may contain arbitrary secrets. */
+export function validateMergedConfig(value: unknown): ActiveMemoryConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new ActiveMemoryConfigError("Active Memory configuration root must be an object");
+  const config = value as ActiveMemoryConfig;
+  validateLikeDefault(config, DEFAULT_CONFIG, "config");
+  for (const provider of [config.providers.rag, config.providers.embedding, config.providers.llm]) {
+    if (!provider || typeof provider.adapter !== "string" || !provider.adapter.trim() || !provider.config || typeof provider.config !== "object" || Array.isArray(provider.config)) throw new ActiveMemoryConfigError("Active Memory providers require a non-empty adapter id and object config");
+  }
+  const lifecycle = config.memoryLifecycle;
+  const unit = [config.capture.confidenceThreshold, config.capture.similarityThreshold, config.assistantCapture.confidenceThreshold, config.assistantCapture.maximumConfidence, config.assistantCapture.priority, config.assistantCapture.similarityThreshold, lifecycle.confidence.initial, lifecycle.confidence.deletionThreshold, lifecycle.confidence.minimum, lifecycle.confidence.maximum, lifecycle.confidence.usefulDelta, lifecycle.confidence.unhelpfulDelta, lifecycle.decay.initialRate, lifecycle.decay.minimumRate, lifecycle.decay.maximumRate, lifecycle.decay.usefulDelta, config.compaction.similarityThreshold];
+  if (unit.some(number => number < 0 || number > 1) || config.recall.minVectorScore < -1 || config.recall.minVectorScore > 1) throw new ActiveMemoryConfigError("Active Memory confidence, priority, similarity, and rate values must be in range");
+  const positiveIntegers = [config.capture.minCharacters, config.capture.contextCharacters, config.assistantCapture.contextCharacters, config.compaction.maximumProposals, config.recall.topK, config.recall.contextCharacters, config.recall.everyTurns, config.recall.everyToolResults, config.recall.thinkingCharacters, config.security.maxMemoryCharacters];
+  const nonNegativeIntegers = [lifecycle.feedback.maxPerMemoryPerSession, lifecycle.feedback.historyLimit, config.recall.perMemoryTurnCooldown, config.recall.maxSteersPerMemoryPerSession];
+  if (positiveIntegers.some(number => !Number.isInteger(number) || number <= 0) || nonNegativeIntegers.some(number => !Number.isInteger(number) || number < 0) || [config.assistantCapture.minimumElapsedMs, config.recall.cooldownMs, config.recall.perMemoryCooldownMs, config.recall.minimumMemoryAgeMinutes].some(number => number < 0)) throw new ActiveMemoryConfigError("Active Memory sizes and cadences must be valid integers or non-negative durations");
+  if (lifecycle.confidence.minimum > lifecycle.confidence.initial || lifecycle.confidence.initial > lifecycle.confidence.maximum || lifecycle.decay.minimumRate > lifecycle.decay.initialRate || lifecycle.decay.initialRate > lifecycle.decay.maximumRate || lifecycle.confidence.deletionThreshold < lifecycle.confidence.minimum || lifecycle.confidence.deletionThreshold > lifecycle.confidence.maximum || config.assistantCapture.confidenceThreshold > config.assistantCapture.maximumConfidence) throw new ActiveMemoryConfigError("Active Memory configuration has inconsistent confidence or decay bounds");
   return config;
+}
+
+function validateLikeDefault(value: unknown, exemplar: unknown, path: string): void {
+  if (path === "config.providers") return;
+  if (typeof exemplar === "boolean") { if (typeof value !== "boolean") throw new ActiveMemoryConfigError(`${path} must be a boolean`); return; }
+  if (typeof exemplar === "string") { if (typeof value !== "string") throw new ActiveMemoryConfigError(`${path} must be a string`); return; }
+  if (typeof exemplar === "number") { if (typeof value !== "number" || !Number.isFinite(value)) throw new ActiveMemoryConfigError(`${path} must be a finite number`); return; }
+  if (Array.isArray(exemplar)) { if (!Array.isArray(value) || value.some(item => typeof item !== "string")) throw new ActiveMemoryConfigError(`${path} must be a string array`); return; }
+  if (exemplar && typeof exemplar === "object") {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new ActiveMemoryConfigError(`${path} must be an object`);
+    for (const [key, child] of Object.entries(exemplar as Record<string, unknown>)) validateLikeDefault((value as Record<string, unknown>)[key], child, `${path}.${key}`);
+  }
+}
+
+export function publicConfig(config: ActiveMemoryConfig): object {
+  return {
+    enabled: config.enabled,
+    providers: { rag: { configured: true }, embedding: { configured: true }, llm: { configured: true } },
+    capture: { enabled: config.capture.enabled, minCharacters: config.capture.minCharacters, confidenceThreshold: config.capture.confidenceThreshold },
+    assistantCapture: { enabled: config.assistantCapture.enabled, minimumElapsedMs: config.assistantCapture.minimumElapsedMs, confidenceThreshold: config.assistantCapture.confidenceThreshold },
+    memoryLifecycle: config.memoryLifecycle,
+    compaction: config.compaction,
+    recall: config.recall,
+    security: { redactSecrets: config.security.redactSecrets, maxMemoryCharacters: config.security.maxMemoryCharacters },
+    activityLog: config.activityLog,
+  };
 }

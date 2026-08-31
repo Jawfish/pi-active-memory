@@ -1,5 +1,6 @@
 import { appendFile, chmod, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { redactSecrets } from "./utils.js";
 
 export interface ActivityEvent {
   timestamp: string;
@@ -31,7 +32,7 @@ export class ActivityLogger {
       sessionId: this.sessionId,
       projectId: this.projectId,
       type,
-      ...(data === undefined ? {} : { data }),
+      ...(data === undefined ? {} : { data: redactActivityStrings(data) }),
     };
     const line = `${JSON.stringify(event)}\n`;
     this.queue = this.queue.then(async () => {
@@ -44,6 +45,13 @@ export class ActivityLogger {
   }
 
   async flush(): Promise<void> { await this.queue; }
+}
+
+function redactActivityStrings(value: unknown): unknown {
+  if (typeof value === "string") return redactSecrets(value);
+  if (Array.isArray(value)) return value.map(redactActivityStrings);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, redactActivityStrings(item)]));
+  return value;
 }
 
 export function activityPathForSession(sessionFile: string): string {

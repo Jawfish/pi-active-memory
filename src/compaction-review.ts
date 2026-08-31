@@ -12,8 +12,18 @@ export async function reviewCompactionPair(
   second: string,
   proposed: string,
   position: { current: number; total: number },
+  registerCancellation?: (cancel: () => void) => () => void,
 ): Promise<CompactionReviewResult> {
   const result = await ctx.ui.custom<CompactionReviewResult>((tui, theme, _keybindings, done) => {
+    let unregisterCancellation = () => {};
+    let completed = false;
+    const finish = (value: CompactionReviewResult) => {
+      if (completed) return;
+      completed = true;
+      unregisterCancellation();
+      done(value);
+    };
+    unregisterCancellation = registerCancellation?.(() => finish({ action: "cancel" })) ?? (() => {});
     let combined = proposed;
     let selected = 0;
     let editing = false;
@@ -56,15 +66,15 @@ export async function reviewCompactionPair(
         refresh();
         return;
       }
-      if (matchesKey(data, Key.escape)) return done({ action: "cancel" });
+      if (matchesKey(data, Key.escape)) return finish({ action: "cancel" });
       if (matchesKey(data, Key.up)) selected = Math.max(0, selected - 1);
       else if (matchesKey(data, Key.down)) selected = Math.min(actions.length - 1, selected + 1);
       else if (matchesKey(data, Key.enter)) {
-        if (selected === 0) return done({ action: "combine", text: combined });
+        if (selected === 0) return finish({ action: "combine", text: combined });
         if (selected === 1) {
           editing = true;
           editor.setText(combined);
-        } else return done({ action: "skip" });
+        } else return finish({ action: "skip" });
       }
       refresh();
     }

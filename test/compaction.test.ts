@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { clusterSimilarMemories, pairSimilarMemories, validateCompactionProposals } from "../src/compaction.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
+import { reviewCompactionPair } from "../src/compaction-review.js";
 import type { MemoryRecord } from "../src/types.js";
 
 function memory(id: string, overrides: Partial<MemoryRecord> = {}): MemoryRecord {
@@ -21,6 +22,16 @@ function memory(id: string, overrides: Partial<MemoryRecord> = {}): MemoryRecord
     ...overrides,
   };
 }
+
+test("compaction review exposes a session-cancellation hook", async () => {
+  let cancel: (() => void) | undefined;
+  const ctx = { ui: { custom: (build: Function) => new Promise(resolve => { build({ requestRender() {} }, { fg: (_name: string, text: string) => text }, {}, resolve); }) } };
+  const review = reviewCompactionPair(ctx as never, "A private", "A secret", "combined", { current: 1, total: 1 }, callback => { cancel = callback; return () => { cancel = undefined; }; });
+  assert.ok(cancel);
+  cancel();
+  assert.deepEqual(await review, { action: "cancel" });
+  assert.equal(cancel, undefined);
+});
 
 test("compaction clusters require complete-link similarity and matching authority partitions", () => {
   const records = [
