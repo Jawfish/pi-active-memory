@@ -24,6 +24,7 @@ export class MemoryEngine {
     private readonly sessionId: string,
     private readonly cwd: string,
     private readonly activity?: ActivitySink,
+    private readonly onMemoryStored?: (record: Readonly<MemoryRecord>, created: boolean) => void,
   ) {}
 
   async capture(userText: string, context: string, signal?: AbortSignal): Promise<number> {
@@ -469,7 +470,15 @@ export class MemoryEngine {
       }
       committed = mutation.record;
     }
-    this.activity?.("capture.stored", { ...this.memoryActivity(committed), created: !replacing });
+    const created = !replacing;
+    this.activity?.("capture.stored", { ...this.memoryActivity(committed), created });
+    try {
+      this.onMemoryStored?.(committed, created);
+    } catch {
+      // Storage is already committed. Display-only feedback must never turn a
+      // successful memory write into a reported capture failure.
+      try { this.activity?.("capture.feedback_failed", { id: committed.id }); } catch {}
+    }
     return true;
   }
 

@@ -42,8 +42,13 @@ class Fast implements FastModelRunner {
 
 const embedder = { model: "test/embed", embed: async (texts: string[]) => texts.map(() => [1, 0]) };
 
-function engine(response: unknown | unknown[], store: Store, embedding: EmbeddingProvider = embedder): MemoryEngine {
-  return new MemoryEngine(DEFAULT_CONFIG, store, embedding, new Fast(Array.isArray(response) ? response : [response]), "project", "session", "/cwd");
+function engine(
+  response: unknown | unknown[],
+  store: Store,
+  embedding: EmbeddingProvider = embedder,
+  onMemoryStored?: (record: Readonly<MemoryRecord>, created: boolean) => void,
+): MemoryEngine {
+  return new MemoryEngine(DEFAULT_CONFIG, store, embedding, new Fast(Array.isArray(response) ? response : [response]), "project", "session", "/cwd", undefined, onMemoryStored);
 }
 
 test("activity events never persist adapter-reported model identifiers", async () => {
@@ -74,6 +79,49 @@ test("capture accepts supported user evidence and records its provenance", async
   assert.equal(store.records[0]?.source.cause, "explicit_user_statement");
   assert.equal(store.records[0]?.priority, 1);
   assert.equal(store.records[0]?.confidence, DEFAULT_CONFIG.memoryLifecycle.confidence.initial);
+});
+
+test("capture reports the committed canonical memory to a display-only sink", async () => {
+  const store = new Store();
+  const notices: Array<{ text: string; created: boolean }> = [];
+  const subject = new MemoryEngine(
+    DEFAULT_CONFIG,
+    store,
+    embedder,
+    new Fast([
+      { memories: [{ text: "The user's favourite color is orange.", kind: "user_profile", scope: "global", confidence: 0.99, evidence: "favourite color is orange" }] },
+      { accept: true, reason: "Explicit durable profile preference" },
+    ]),
+    "project",
+    "session",
+    "/cwd",
+    undefined,
+    (record, created) => notices.push({ text: record.text, created }),
+  );
+
+  assert.equal(await subject.capture("My favourite color is orange.", ""), 1);
+  assert.deepEqual(notices, [{ text: "The user's favourite color is orange.", created: true }]);
+});
+
+test("display feedback failures cannot turn a committed write into a capture failure", async () => {
+  const store = new Store();
+  const subject = new MemoryEngine(
+    DEFAULT_CONFIG,
+    store,
+    embedder,
+    new Fast([
+      { memories: [{ text: "The user's favourite color is orange.", kind: "user_profile", scope: "global", confidence: 0.99, evidence: "favourite color is orange" }] },
+      { accept: true, reason: "Explicit durable profile preference" },
+    ]),
+    "project",
+    "session",
+    "/cwd",
+    undefined,
+    () => { throw new Error("TUI unavailable"); },
+  );
+
+  assert.equal(await subject.capture("My favourite color is orange.", ""), 1);
+  assert.equal(store.records.length, 1);
 });
 
 test("capture rejects legacy or unsupported memory categories", async () => {
@@ -131,15 +179,17 @@ test("assistant candidate searches first and updates an assistant memory", async
   const existing = { ...memory("existing", "older-session", "2020-01-01T00:00:00Z"), source: { actor: "assistant" as const, sessionId: "older-session", cwd: "/cwd", cause: "old investigation", reason: "hard to find" }, priority: 0.55 };
   store.records = [existing];
   store.matches = [{ record: existing, score: 0.95 }];
+  const notices: Array<{ id: string; created: boolean }> = [];
   const subject = engine([
     { memories: [{ text: "The parser registry is in src/parser-registry.ts.", kind: "fact", scope: "global", confidence: 0.7, evidence: "parser registry moved to src/parser-registry.ts", whyStored: "Locating the move required tracing generated imports." }] },
     { accept: true, reason: "Non-trivial trace" },
     { action: "replace", targetId: "existing", text: "The parser registry is in src/parser-registry.ts." },
-  ], store);
+  ], store, embedder, (record, created) => notices.push({ id: record.id, created }));
   assert.equal(await subject.captureAssistantInvestigation("The parser registry moved to src/parser-registry.ts after tracing generated imports.", "Locate parser registry", 80_000), 1);
   assert.equal(store.records[0]?.id, "existing");
   assert.equal(store.records[0]?.sourceHistory?.[0]?.cause, "old investigation");
   assert.equal(store.records[0]?.source.cause, "Locate parser registry");
+  assert.deepEqual(notices, [{ id: "existing", created: false }]);
 });
 
 test("assistant memory correction replaces text and preserves provenance", async () => {

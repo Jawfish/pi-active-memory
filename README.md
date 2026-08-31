@@ -17,6 +17,7 @@ user/long investigation ──► fast validation model ──► embeddings ─
 - Assistant-sourced memories are allowed only after a substantial investigation lasting at least one minute. A separate validator rejects common knowledge, simple-search results, routine facts, plans, progress, and guesses.
 - Every record stores its actor, session ID, cause, storage rationale, evidence, confidence, and elapsed investigation time where applicable. Legacy records are upgraded on startup with explicit migration provenance rather than leaving fields absent.
 - Searches for related memories before every automatic or explicit write, then chooses add, update, or no-op. Assistant findings cannot overwrite user-sourced claims.
+- Shows every successfully captured create or update in the TUI transcript with the canonical memory text; capture feedback is display-only and never enters model context.
 - New memories start at neutral usefulness confidence. Bounded, steer-bound `memory_feedback` raises or lowers future ranking while preventing duplicate and runaway reinforcement.
 - Assistant findings retain lower ranking priority than user-caused memories.
 - Memories use UTC-day confidence decay and are soft-deleted when confidence reaches the configured threshold. The default decay rate is unchanged (0.28, approximately five unused UTC days to cross the default deletion threshold); inactive-session expiry is not implemented.

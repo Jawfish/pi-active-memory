@@ -25,12 +25,22 @@ import { cleanupFailedStartup, safeStartupFailureMessage } from "./startup-lifec
 import { QdrantVectorStore } from "./stores/qdrant-store.js";
 import { formatSteerSentence, orderedFeedbackOutcomes, type SteerFeedbackOutcome } from "./steer-display.js";
 import { MemorySteerLimiter } from "./steer-frequency.js";
-import type { ActiveMemoryConfig, EmbeddingModels, EmbeddingProvider, FastModelRunner, MemoryKind, MemoryRecord, MemoryScope, VectorStore } from "./types.js";
+import type { ActiveMemoryConfig, EmbeddingModels, EmbeddingProvider, FastModelRunner, MemoryActor, MemoryKind, MemoryRecord, MemoryScope, VectorStore } from "./types.js";
 import { boundedAssistantInvestigation, boundedContext, contextText, sanitizePersistedText, stableProjectId, textFromContent } from "./utils.js";
 
 interface SteerDetails { memoryIds: string[]; scores: number[]; reason: string; instruction: string; projectId: string; feedbackToken: string; source: "active-memory" }
 interface Investigation { startedAt: number; cause: string; toolResults: number; startEntryCount?: number }
+export interface MemoryCaptureEntryDetails {
+  id: string;
+  text: string;
+  kind: MemoryKind;
+  scope: MemoryScope;
+  projectId?: string;
+  actor: MemoryActor;
+  created: boolean;
+}
 const SUPPORTED_MEMORY_KINDS: MemoryKind[] = ["user_profile", "fact", "skill_workflow"];
+const MEMORY_CAPTURE_ENTRY_TYPE = "active-memory-capture";
 const STEER_TOOL_NAME = "memory_steer";
 const STEER_TOOL_PARAMETERS = Type.Object({ text: Type.String() });
 // SAFETY: ToolExecutionComponent only calls requestRender on this render-only TUI stub.
@@ -40,6 +50,29 @@ const EMBEDDING_BATCH_SIZE = 64;
 
 function isExpectedAbort(error: unknown, signal?: AbortSignal): boolean {
   return Boolean(signal?.aborted) || (error instanceof Error && error.name === "AbortError");
+}
+
+function safeCaptureDisplayText(value: string): string {
+  return value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, "");
+}
+
+export function formatMemoryCaptureEntry(details: MemoryCaptureEntryDetails, expanded = false): string {
+  const label = details.created ? "Memory captured" : "Memory updated";
+  let text = `🧠 ${label}\n${safeCaptureDisplayText(details.text)}`;
+  if (expanded) {
+    const scope = details.scope === "project" && details.projectId ? `project:${safeCaptureDisplayText(details.projectId)}` : details.scope;
+    text += `\n${safeCaptureDisplayText(details.id)} [${scope}/${details.kind}/${details.actor}]`;
+  }
+  return text;
+}
+
+function validMemoryCaptureEntry(value: unknown): value is MemoryCaptureEntryDetails {
+  if (!value || typeof value !== "object") return false;
+  const data = value as Partial<MemoryCaptureEntryDetails>;
+  return typeof data.id === "string" && typeof data.text === "string"
+    && (data.kind === "user_profile" || data.kind === "fact" || data.kind === "skill_workflow")
+    && (data.scope === "global" || data.scope === "project")
+    && (data.actor === "user" || data.actor === "assistant") && typeof data.created === "boolean";
 }
 
 function metadataKeyForStore(store: VectorStore, rag: ActiveMemoryConfig["providers"]["rag"]): string {
@@ -223,6 +256,14 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     sessionStats[name] += amount;
     pi.appendEntry(SESSION_STATS_ENTRY_TYPE, { name, amount });
   };
+
+  pi.registerEntryRenderer(MEMORY_CAPTURE_ENTRY_TYPE, (entry, options, theme) => {
+    if (!validMemoryCaptureEntry(entry.data)) return new Text(theme.fg("warning", "🧠 Memory capture details unavailable"), 1, 0);
+    const lines = formatMemoryCaptureEntry(entry.data, options.expanded).split("\n");
+    lines[0] = theme.fg("success", lines[0]!);
+    if (options.expanded) lines[lines.length - 1] = theme.fg("dim", lines.at(-1)!);
+    return new Text(lines.join("\n"), 1, 0);
+  });
 
   pi.registerMessageRenderer<SteerDetails>("active-memory-steer", (message, options, theme) => {
     const rawContent = typeof message.content === "string" ? message.content : textFromContent(message.content, false);
@@ -417,6 +458,17 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       if (type === "capture.stored" && typeof data === "object" && data !== null && (data as { created?: unknown }).created === true) {
         incrementSessionStat("memoriesCreated");
       }
+    }, (record, created) => {
+      if (callbackGeneration !== generation || readyGeneration !== callbackGeneration || ctx.mode !== "tui") return;
+      pi.appendEntry(MEMORY_CAPTURE_ENTRY_TYPE, {
+        id: record.id,
+        text: record.text,
+        kind: record.kind,
+        scope: record.scope,
+        ...(record.projectId ? { projectId: record.projectId } : {}),
+        actor: record.source.actor ?? "user",
+        created,
+      } satisfies MemoryCaptureEntryDetails);
     });
     const lifecycle = await engine.sweepLifecycle();
     if (thisGeneration !== generation) {
