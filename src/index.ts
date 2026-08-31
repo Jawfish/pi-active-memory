@@ -41,6 +41,7 @@ export interface MemoryCaptureEntryDetails {
 }
 const SUPPORTED_MEMORY_KINDS: MemoryKind[] = ["user_profile", "fact", "skill_workflow"];
 const MEMORY_CAPTURE_ENTRY_TYPE = "active-memory-capture";
+const MEMORY_ICON = "󰧑";
 const STEER_TOOL_NAME = "memory_steer";
 const STEER_TOOL_PARAMETERS = Type.Object({ text: Type.String() });
 // SAFETY: ToolExecutionComponent only calls requestRender on this render-only TUI stub.
@@ -58,7 +59,7 @@ function safeCaptureDisplayText(value: string): string {
 
 export function formatMemoryCaptureEntry(details: MemoryCaptureEntryDetails, expanded = false): string {
   const label = details.created ? "Memory captured" : "Memory updated";
-  let text = `🧠 ${label}\n${safeCaptureDisplayText(details.text)}`;
+  let text = `${MEMORY_ICON} ${label}\n${safeCaptureDisplayText(details.text)}`;
   if (expanded) {
     const scope = details.scope === "project" && details.projectId ? `project:${safeCaptureDisplayText(details.projectId)}` : details.scope;
     text += `\n${safeCaptureDisplayText(details.id)} [${scope}/${details.kind}/${details.actor}]`;
@@ -258,7 +259,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   };
 
   pi.registerEntryRenderer(MEMORY_CAPTURE_ENTRY_TYPE, (entry, options, theme) => {
-    if (!validMemoryCaptureEntry(entry.data)) return new Text(theme.fg("warning", "🧠 Memory capture details unavailable"), 1, 0);
+    if (!validMemoryCaptureEntry(entry.data)) return new Text(theme.fg("warning", `${MEMORY_ICON} Memory capture details unavailable`), 1, 0);
     const lines = formatMemoryCaptureEntry(entry.data, options.expanded).split("\n");
     lines[0] = theme.fg("success", lines[0]!);
     if (options.expanded) lines[lines.length - 1] = theme.fg("dim", lines.at(-1)!);
@@ -274,7 +275,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     const indicators = outcomes.map((outcome) => outcome === "useful"
       ? theme.fg("success", "🟢")
       : theme.fg("error", "🔴"));
-    let text = `${theme.fg("accent", "🧠 Memory steer:")} ${steer}${indicators.length ? ` ${indicators.join(" ")}` : ""}`;
+    let text = `${theme.fg("accent", `${MEMORY_ICON} Memory steer:`)} ${steer}${indicators.length ? ` ${indicators.join(" ")}` : ""}`;
     if (options.expanded && details) {
       text += `\n${theme.fg("dim", `memories: ${details.memoryIds.join(", ")}`)}`;
       if (details.reason) text += `\n${theme.fg("dim", `reason: ${details.reason}`)}`;

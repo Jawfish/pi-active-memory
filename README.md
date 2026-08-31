@@ -7,7 +7,7 @@ user/long investigation ──► fast validation model ──► embeddings ─
       │                                                │
       └── activity scheduler ──► query + relevance judge
                                       │
-                              🧠 Memory steer to Pi
+                                 Memory steer to Pi
 ```
 
 ## Key behavior

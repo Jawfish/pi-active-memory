@@ -13,20 +13,20 @@ const details: MemoryCaptureEntryDetails = {
 };
 
 test("capture feedback always shows the committed memory text", () => {
-  assert.equal(formatMemoryCaptureEntry(details), "🧠 Memory captured\nThe project uses pnpm.");
+  assert.equal(formatMemoryCaptureEntry(details), "󰧑 Memory captured\nThe project uses pnpm.");
 });
 
 test("expanded capture feedback shows provenance metadata", () => {
   assert.equal(
     formatMemoryCaptureEntry({ ...details, created: false }, true),
-    "🧠 Memory updated\nThe project uses pnpm.\nmemory-id [project:project-id/fact/user]",
+    "󰧑 Memory updated\nThe project uses pnpm.\nmemory-id [project:project-id/fact/user]",
   );
 });
 
 test("capture feedback strips terminal control sequences from persisted session data", () => {
   assert.equal(
     formatMemoryCaptureEntry({ ...details, text: "safe\u001b[31m", id: "id\u0007" }, true),
-    "🧠 Memory captured\nsafe[31m\nid [project:project-id/fact/user]",
+    "󰧑 Memory captured\nsafe[31m\nid [project:project-id/fact/user]",
   );
 });
 
