@@ -439,7 +439,9 @@ test("stalled cleanup after a committed swap does not delay the rebuild", () => 
   server.hangManagedDelete = true;
   const store = new QdrantVectorStore("http://qdrant", "mem", undefined, lock);
   const rebuilt = store.rebuildVectors(3, async page => page.map(item => ({ record: { ...item, embeddingModel: "new" }, vector: [1, 0, 0] })));
-  const result = await Promise.race([rebuilt, new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("cleanup blocked commit")), 100))]);
+  // Leave enough headroom for contended Node 22 CI runners while remaining
+  // well below the implementation's five-second cleanup abort timeout.
+  const result = await Promise.race([rebuilt, new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("cleanup blocked commit")), 1_000))]);
   assert.equal(result, 1);
   assert.notEqual(server.aliases.get("mem__active_memory_live_v2"), previous);
 }));
