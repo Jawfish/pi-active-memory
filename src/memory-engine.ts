@@ -6,7 +6,7 @@ import type { ActiveMemoryConfig, EmbeddingProvider, FastModelRunner, MemoryActo
 import { applyConfidenceFeedback, type FeedbackOutcome } from "./feedback.js";
 import { advanceMemoryLifecycle, initializeMemoryLifecycle, reinforceMemoryLifecycle } from "./lifecycle.js";
 import { assistantExtractionPrompt, assistantValidationPrompt, compactionPrompt, compactionValidationPrompt, extractionPrompt, judgePrompt, mergePrompt, queryPrompt, validationPrompt } from "./prompts.js";
-import { evidenceAppearsInUserMessage, isTransientTaskMemory, redactSecrets, sourceEvidenceAppearsInContext } from "./utils.js";
+import { evidenceAppearsInUserMessage, isTransientTaskMemory, redactSecrets, sanitizePersistedText, sourceEvidenceAppearsInContext } from "./utils.js";
 
 interface Extracted { text: string; kind: MemoryKind; scope: MemoryScope; confidence: number; evidence: string }
 interface AssistantExtracted extends Extracted { whyStored: string }
@@ -33,7 +33,6 @@ export class MemoryEngine {
     this.activity?.("capture.extracted", {
       count: result.memories?.length ?? 0,
       memories: (result.memories ?? []).map((memory) => ({ kind: memory.kind, scope: memory.scope, confidence: memory.confidence, evidenceValid: typeof memory.evidence === "string" && evidenceAppearsInUserMessage(memory.evidence, userText), ...(this.config.activityLog.includeText ? { text: memory.text, evidence: memory.evidence } : {}) })),
-      fastModel: this.fast.selectedModel(),
     });
     let stored = 0;
     for (const raw of result.memories ?? []) {
@@ -50,7 +49,7 @@ export class MemoryEngine {
           validationPrompt(userText, context, { text, kind: raw.kind, scope: raw.scope, evidence: raw.evidence }, this.config.prompts),
           signal,
         );
-        this.activity?.("capture.validated", { accept: validation.accept === true, reason: validation.reason ?? "", fastModel: this.fast.selectedModel() });
+        this.activity?.("capture.validated", { accept: validation.accept === true, ...(this.config.activityLog.includeText ? { reason: validation.reason ?? "" } : {}) });
         return validation.accept === true;
       };
       if (!await validate(raw.text)) {
@@ -145,9 +144,7 @@ export class MemoryEngine {
     if (!record) throw new Error(`Active memory ${memoryId} was not found`);
     if (record.source.actor !== "assistant") throw new Error("Only assistant-generated memories can be corrected by the model");
     if (!reason.trim()) throw new Error("A concrete correction reason is required");
-    let text = correctedText.trim().slice(0, this.config.security.maxMemoryCharacters);
-    if (this.config.security.redactSecrets) text = redactSecrets(text);
-    if (!text || /[\r\n]/.test(text)) throw new Error("Corrected memory must be one non-empty line");
+    const text = sanitizePersistedText(correctedText, this.config.security.maxMemoryCharacters, this.config.security.redactSecrets);
     if (text === record.text) throw new Error("Corrected memory text must differ from the existing text");
     const now = new Date().toISOString();
     const source: MemorySource = {
@@ -170,9 +167,22 @@ export class MemoryEngine {
     };
     const [vector] = await embedDocuments(this.embedder, [text], signal);
     if (!vector) throw new Error("Embedding failed");
-    await this.store.upsert(updated, vector);
+    const mutation = await this.store.mutate(memoryId, latest => {
+      if (latest.status !== "active" || latest.source.actor !== "assistant" || latest.kind !== record.kind || latest.scope !== record.scope || latest.projectId !== record.projectId || latest.text !== record.text || JSON.stringify(latest.source) !== JSON.stringify(record.source)) return undefined;
+      return { record: {
+        ...latest,
+        text,
+        source,
+        sourceHistory: [...(latest.sourceHistory ?? []), latest.source],
+        confidence: Math.min(latest.confidence, this.config.assistantCapture.maximumConfidence),
+        priority: Math.min(latest.priority ?? this.config.assistantCapture.priority, this.config.assistantCapture.priority),
+        updatedAt: now,
+        embeddingModel: embeddingModels(this.embedder).document,
+      }, vector };
+    });
+    if (mutation.status !== "updated" || !mutation.record) throw new Error("Assistant memory changed while correction was being prepared");
     this.activity?.("memory.corrected", { id: memoryId, actor: "assistant", ...(this.config.activityLog.includeText ? { previousText: record.text, text, reason: source.reason } : {}) });
-    return updated;
+    return mutation.record;
   }
 
   async sweepLifecycle(now = new Date()): Promise<{ initialized: number; expired: number }> {
@@ -181,13 +191,20 @@ export class MemoryEngine {
     let initialized = 0;
     let expired = 0;
     for (const record of records) {
-      const result = advanceMemoryLifecycle(record, now, this.sessionId, this.config.memoryLifecycle);
-      if (!result.initialized && !result.expiredBy && result.decayedDays === 0) continue;
-      if (!await this.store.update(result.record)) continue;
-      if (result.initialized) initialized++;
-      if (result.expiredBy) {
+      let before: MemoryRecord | undefined;
+      let committed: ReturnType<typeof advanceMemoryLifecycle> | undefined;
+      const mutation = await this.store.mutate(record.id, latest => {
+        const current = advanceMemoryLifecycle(latest, now, this.sessionId, this.config.memoryLifecycle);
+        if (!current.initialized && !current.expiredBy && current.decayedDays === 0) return undefined;
+        before = structuredClone(latest);
+        committed = current;
+        return { record: current.record };
+      });
+      if (mutation.status !== "updated" || !committed || !before) continue;
+      if (committed.initialized) initialized++;
+      if (committed.expiredBy) {
         expired++;
-        this.activity?.("memory.expired", { id: record.id, cause: result.expiredBy, confidenceBefore: record.confidence, confidenceAfter: result.record.confidence, decayRate: result.record.decayRate, decayedDays: result.decayedDays });
+        this.activity?.("memory.expired", { id: record.id, cause: committed.expiredBy, confidenceBefore: before.confidence, confidenceAfter: mutation.record!.confidence, decayRate: mutation.record!.decayRate, decayedDays: committed.decayedDays });
       }
     }
     if (initialized) this.activity?.("lifecycle.migrated", { records: initialized, policy: "full_grace_from_first_post-upgrade_session" });
@@ -199,21 +216,17 @@ export class MemoryEngine {
     const record = records.find((candidate) => candidate.id === memoryId && candidate.status === "active");
     if (!record) return undefined;
     const at = new Date().toISOString();
-    let updated = applyConfidenceFeedback(record, {
-      outcome,
-      sessionId: this.sessionId,
-      steerToken,
-      reason: this.safeSourceText(reason, 500),
-      at,
-    }, this.config.memoryLifecycle);
-    if (this.config.memoryLifecycle.enabled) {
-      updated = outcome === "useful"
-        ? reinforceMemoryLifecycle(updated, new Date(at), this.sessionId, this.config.memoryLifecycle, "useful_feedback")
-        : advanceMemoryLifecycle(updated, new Date(at), this.sessionId, this.config.memoryLifecycle).record;
-    }
-    if (!await this.store.update(updated)) return undefined;
-    this.activity?.("feedback.recorded", { id: memoryId, outcome, confidenceBefore: record.confidence, confidenceAfter: updated.confidence, steerToken, ...(this.config.activityLog.includeText ? { reason: updated.feedback?.history.at(-1)?.reason } : {}) });
-    return updated;
+    let confidenceBefore: number | undefined;
+    const mutation = await this.store.mutate(memoryId, latest => {
+      if (latest.status !== "active") return undefined;
+      confidenceBefore = latest.confidence;
+      let next = applyConfidenceFeedback(latest, { outcome, sessionId: this.sessionId, steerToken, reason: this.safeSourceText(reason, 500), at }, this.config.memoryLifecycle);
+      if (this.config.memoryLifecycle.enabled) next = outcome === "useful" ? reinforceMemoryLifecycle(next, new Date(at), this.sessionId, this.config.memoryLifecycle, "useful_feedback") : advanceMemoryLifecycle(next, new Date(at), this.sessionId, this.config.memoryLifecycle).record;
+      return { record: next };
+    });
+    if (mutation.status !== "updated") return undefined;
+    this.activity?.("feedback.recorded", { id: memoryId, outcome, confidenceBefore, confidenceAfter: mutation.record!.confidence, steerToken, ...(this.config.activityLog.includeText ? { reason: mutation.record?.feedback?.history.at(-1)?.reason } : {}) });
+    return mutation.record;
   }
 
   async planCompaction(signal?: AbortSignal): Promise<CompactionPlan> {
@@ -249,9 +262,7 @@ export class MemoryEngine {
     if (!records.every((record) => record.scope === first.scope && record.kind === first.kind && memoryActor(record) === memoryActor(first) && record.projectId === first.projectId)) {
       throw new Error("Compaction cannot cross scope, kind, project, or authority boundaries");
     }
-    let text = proposal.text.trim().slice(0, this.config.security.maxMemoryCharacters);
-    if (this.config.security.redactSecrets) text = redactSecrets(text);
-    if (!text || /[\r\n]/.test(text)) throw new Error("Compacted memory must be one non-empty line");
+    const text = sanitizePersistedText(proposal.text, this.config.security.maxMemoryCharacters, this.config.security.redactSecrets);
     const validation = await this.fast.json<{ accept?: boolean; reason?: string }>(
       this.config.prompts.jsonOnly,
       compactionValidationPrompt(records.map((record) => ({ id: record.id, text: record.text })), text, this.config.prompts),
@@ -301,21 +312,22 @@ export class MemoryEngine {
       : baseCompacted;
     const [vector] = await embedDocuments(this.embedder, [compacted.text], signal);
     if (!vector) throw new Error("Embedding failed");
-    await this.store.upsert(compacted, vector);
-    for (const record of records) {
-      if (!await this.store.update({ ...record, status: "superseded", updatedAt: now })) {
-        throw new Error(`Could not supersede memory ${record.id}`);
-      }
-    }
-    this.activity?.("compaction.applied", { id: compacted.id, sourceIds: [...sourceIds], actor, scope: compacted.scope, kind: compacted.kind, ...(this.config.activityLog.includeText ? { text: compacted.text } : {}) });
-    return compacted;
+    const reviewedById = new Map(records.map(record => [record.id, JSON.stringify(record)]));
+    const stored = await this.store.compact([...sourceIds], latest => {
+      // Storage may order source ids differently from the reviewed proposal. Match by
+      // identity, while still rejecting any changed/missing/extra reviewed record.
+      if (latest.length !== reviewedById.size || latest.some(record => reviewedById.get(record.id) !== JSON.stringify(record))) throw new Error("Compaction sources changed after review");
+      return { record: compacted, vector };
+    });
+    this.activity?.("compaction.applied", { id: stored.id, sourceIds: [...sourceIds], actor, scope: stored.scope, kind: stored.kind, ...(this.config.activityLog.includeText ? { text: stored.text } : {}) });
+    return stored;
   }
 
   async recall(context: string, signal?: AbortSignal, excludedIds: ReadonlySet<string> = new Set(), activeContext = context): Promise<RecallResult | undefined> {
     if (!this.config.recall.enabled || !context.trim()) return undefined;
     this.activity?.("recall.started", { contextCharacters: context.length });
     const query = await this.fast.json<{ query?: string }>(this.config.prompts.jsonOnly, queryPrompt(context, this.config.prompts), signal);
-    this.activity?.("recall.query", { query: this.config.activityLog.includeText ? query.query ?? "" : undefined, fastModel: this.fast.selectedModel() });
+    this.activity?.("recall.query", { query: this.config.activityLog.includeText ? query.query ?? "" : undefined });
     if (!query.query?.trim()) return undefined;
     const [vector] = await embedQuery(this.embedder, [query.query.trim()], signal);
     if (!vector) return undefined;
@@ -341,20 +353,18 @@ export class MemoryEngine {
     this.activity?.("recall.judged", {
       relevantIds: relevant.map((match) => match.record.id),
       ...(this.config.activityLog.includeText ? { reason: judged.reason ?? "" } : {}),
-      fastModel: this.fast.selectedModel(),
     });
     if (!relevant.length) return undefined;
-    if (this.config.memoryLifecycle.enabled) await this.reinforceRecords(relevant.map((match) => match.record), "relevant_recall");
     return { reason: judged.reason?.trim() ?? "", relevant };
   }
 
-  private async reinforceRecords(records: MemoryRecord[], cause: "relevant_recall" | "useful_feedback"): Promise<void> {
+  /** Apply relevance only after the runtime has actually queued the steer. */
+  async recordRecallDelivery(records: readonly MemoryRecord[]): Promise<void> {
+    if (!this.config.memoryLifecycle.enabled) return;
     const now = new Date();
     for (const record of records) {
-      const updated = reinforceMemoryLifecycle(record, now, this.sessionId, this.config.memoryLifecycle, cause);
-      if (await this.store.update(updated)) {
-        this.activity?.("memory.reinforced", { id: record.id, cause, confidence: updated.confidence, decayRate: updated.decayRate, lastDecayDate: updated.lifecycle?.lastDecayDate });
-      }
+      const mutation = await this.store.mutate(record.id, latest => latest.status === "active" ? { record: reinforceMemoryLifecycle(latest, now, this.sessionId, this.config.memoryLifecycle, "relevant_recall") } : undefined);
+      if (mutation.status === "updated" && mutation.record) this.activity?.("memory.reinforced", { id: record.id, cause: "relevant_recall", confidence: mutation.record.confidence, decayRate: mutation.record.decayRate, lastDecayDate: mutation.record.lifecycle?.lastDecayDate });
     }
   }
 
@@ -364,7 +374,7 @@ export class MemoryEngine {
       assistantValidationPrompt(investigation, cause, elapsedMs, candidate, this.config.prompts),
       signal,
     );
-    this.activity?.("assistant_capture.validated", { accept: validation.accept === true, reason: validation.reason ?? "", fastModel: this.fast.selectedModel() });
+    this.activity?.("assistant_capture.validated", { accept: validation.accept === true, ...(this.config.activityLog.includeText ? { reason: validation.reason ?? "" } : {}) });
     return validation.accept === true;
   }
 
@@ -374,10 +384,11 @@ export class MemoryEngine {
     similarityThreshold: number,
     validateCanonical: (text: string) => Promise<boolean>,
     signal?: AbortSignal,
+    conflictRetries = 0,
   ): Promise<boolean> {
-    let text = raw.text.trim().slice(0, this.config.security.maxMemoryCharacters);
-    if (this.config.security.redactSecrets) text = redactSecrets(text);
-    if (!text || text.includes("[REDACTED_PRIVATE_KEY]")) return false;
+    let text: string;
+    try { text = sanitizePersistedText(raw.text, this.config.security.maxMemoryCharacters, this.config.security.redactSecrets); } catch { return false; }
+    if (text.includes("[REDACTED_PRIVATE_KEY]")) return false;
     const [vector] = await embedDocuments(this.embedder, [text], signal);
     if (!vector) return false;
 
@@ -404,7 +415,9 @@ export class MemoryEngine {
       );
       action = decision.action ?? "add";
       targetId = decision.targetId ?? undefined;
-      if (decision.text?.trim()) text = decision.text.trim().slice(0, this.config.security.maxMemoryCharacters);
+      if (decision.text?.trim()) {
+        try { text = sanitizePersistedText(decision.text, this.config.security.maxMemoryCharacters, this.config.security.redactSecrets); } catch { return false; }
+      }
     }
     if (action === "noop") return false;
     const target = action === "replace" ? plausible.find((match) => match.record.id === targetId)?.record : undefined;
@@ -412,7 +425,7 @@ export class MemoryEngine {
     if (source.actor === "assistant" && target && memoryActor(target) === "user") return false;
     if (text !== raw.text.trim() && !await validateCanonical(text)) return false;
 
-    if (this.config.security.redactSecrets) text = redactSecrets(text);
+    try { text = sanitizePersistedText(text, this.config.security.maxMemoryCharacters, this.config.security.redactSecrets); } catch { return false; }
     const [canonicalVector] = text === raw.text.trim() ? [vector] : await embedDocuments(this.embedder, [text], signal);
     if (!canonicalVector) return false;
     const replacing = action === "replace" ? target : undefined;
@@ -428,7 +441,7 @@ export class MemoryEngine {
       decayRate: replacing?.decayRate ?? this.config.memoryLifecycle.decay.initialRate,
       priority: actor === "assistant" ? this.config.assistantCapture.priority : 1,
       status: "active",
-      ...(replacing ? { supersedes: [...(replacing.supersedes ?? []), replacing.id], sourceHistory: [...(replacing.sourceHistory ?? []), replacing.source] } : {}),
+      ...(replacing ? { supersedes: (replacing.supersedes ?? []).filter(id => id !== replacing.id), sourceHistory: [...(replacing.sourceHistory ?? []), replacing.source] } : {}),
       source,
       ...(replacing?.feedback ? { feedback: replacing.feedback } : {}),
       ...(replacing?.lifecycle ? { lifecycle: replacing.lifecycle } : {}),
@@ -440,22 +453,37 @@ export class MemoryEngine {
     const record = this.config.memoryLifecycle.enabled
       ? initializeMemoryLifecycle(baseRecord, new Date(now), this.sessionId, this.config.memoryLifecycle)
       : baseRecord;
-    await this.store.upsert(record, canonicalVector);
-    this.activity?.("capture.stored", { ...this.memoryActivity(record), created: !replacing });
+    let committed = record;
+    if (!replacing) {
+      if (await this.store.insert({ record, vector: canonicalVector }) !== "inserted") return false;
+    } else {
+      const mutation = await this.store.mutate(replacing.id, latest => {
+        if (latest.status !== "active" || latest.scope !== replacing.scope || latest.kind !== replacing.kind || latest.projectId !== replacing.projectId || memoryActor(latest) !== memoryActor(replacing) || latest.text !== replacing.text || JSON.stringify(latest.source) !== JSON.stringify(replacing.source)) return undefined;
+        const priority = actor === memoryActor(latest) ? latest.priority : actor === "user" ? 1 : this.config.assistantCapture.priority;
+        return { record: { ...record, confidence: latest.confidence, decayRate: latest.decayRate, priority, feedback: latest.feedback, lifecycle: latest.lifecycle, sourceHistory: [...(latest.sourceHistory ?? []), latest.source], supersedes: (latest.supersedes ?? []).filter(id => id !== latest.id) }, vector: canonicalVector };
+      });
+      if (mutation.status !== "updated" || !mutation.record) {
+        this.activity?.("capture.conflict", { targetId: replacing.id, retry: conflictRetries + 1 });
+        if (conflictRetries < 2) return this.resolveAndStore(raw, source, similarityThreshold, validateCanonical, signal, conflictRetries + 1);
+        throw new Error("Memory changed repeatedly while capture was being resolved; retry the capture");
+      }
+      committed = mutation.record;
+    }
+    this.activity?.("capture.stored", { ...this.memoryActivity(committed), created: !replacing });
     return true;
   }
 
   private safeSourceText(value: string, max: number): string {
-    const sliced = value.slice(0, max);
-    return this.config.security.redactSecrets ? redactSecrets(sliced) : sliced;
+    const redacted = this.config.security.redactSecrets ? redactSecrets(value) : value;
+    return redacted.slice(0, max);
   }
 
   private memoryActivity(record: MemoryRecord): object {
     return {
       id: record.id, kind: record.kind, scope: record.scope, projectId: record.projectId,
       actor: memoryActor(record), confidence: record.confidence, priority: memoryPriority(record),
-      cause: record.source.cause, reason: record.source.reason, elapsedMs: record.source.elapsedMs,
-      ...(this.config.activityLog.includeText ? { text: record.text } : {}),
+      elapsedMs: record.source.elapsedMs,
+      ...(this.config.activityLog.includeText ? { text: record.text, cause: record.source.cause, reason: record.source.reason } : {}),
     };
   }
 }
@@ -478,7 +506,7 @@ export function rankMemoryMatches(matches: MemoryMatch[]): MemoryMatch[] {
 function uniqueSources(sources: MemorySource[]): MemorySource[] {
   const seen = new Set<string>();
   return sources.filter((source) => {
-    const key = JSON.stringify([source.actor ?? "user", source.sessionId, source.cwd, source.cause, source.reason, source.elapsedMs, source.evidence]);
+    const key = JSON.stringify([source.actor ?? "user", source.sessionId, source.cwd, source.cause, source.reason, source.elapsedMs, source.evidence, source.userText]);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;

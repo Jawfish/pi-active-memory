@@ -10,21 +10,25 @@ import { DeferredSerialQueue } from "./background-queue.js";
 import type { CompactionProposal } from "./compaction.js";
 import { DAILY_SWEEP_POLL_INTERVAL_MS, DailySweepGate } from "./daily-sweep.js";
 import { reviewCompactionPair } from "./compaction-review.js";
-import { DEFAULT_CONFIG, loadConfig, publicConfig, saveUserCompactionThreshold, saveUserMemoryLifecycle } from "./config.js";
-import { embeddingStoreKey, readEmbeddingModels, writeEmbeddingModels } from "./embedding-metadata.js";
+import { DEFAULT_CONFIG, loadConfig, publicConfig, saveUserCompactionThreshold, saveUserMemoryLifecycleSetting } from "./config.js";
+import { embeddingStoreKey, legacyEmbeddingStoreKey, readEmbeddingGeneration, withEmbeddingMigrationLocks, writeEmbeddingGenerationAliases } from "./embedding-metadata.js";
+import { guardEmbeddingGeneration, sameEmbeddingModels } from "./embedding-generation.js";
 import { embedDocuments, embeddingModels, embedQuery } from "./embeddings.js";
 import { SteerFeedbackLedger } from "./feedback.js";
 import { ActiveMemoryFooterStatus } from "./footer-status.js";
 import { MemoryEngine, rankMemoryMatches } from "./memory-engine.js";
 import { renderPrompt, structuredSteerMessage } from "./prompts.js";
 import { displayedSessionStats, emptySessionStats, formatSessionStats, SESSION_STATS_ENTRY_TYPE, sessionStatsFromEntries, type SessionStatName } from "./session-stats.js";
+import { restoreSessionState } from "./session-restore.js";
 import { activeMemoryStatus, compactionProgressStatus } from "./status.js";
+import { cleanupFailedStartup, safeStartupFailureMessage } from "./startup-lifecycle.js";
+import { QdrantVectorStore } from "./stores/qdrant-store.js";
 import { formatSteerSentence, orderedFeedbackOutcomes, type SteerFeedbackOutcome } from "./steer-display.js";
 import { MemorySteerLimiter } from "./steer-frequency.js";
 import type { ActiveMemoryConfig, EmbeddingModels, EmbeddingProvider, FastModelRunner, MemoryKind, MemoryRecord, MemoryScope, VectorStore } from "./types.js";
-import { boundedAssistantInvestigation, boundedContext, contextText, redactSecrets, stableProjectId, textFromContent } from "./utils.js";
+import { boundedAssistantInvestigation, boundedContext, contextText, sanitizePersistedText, stableProjectId, textFromContent } from "./utils.js";
 
-interface SteerDetails { memoryIds: string[]; scores: number[]; reason: string; instruction?: string; projectId: string; feedbackToken: string; source: "active-memory" }
+interface SteerDetails { memoryIds: string[]; scores: number[]; reason: string; instruction: string; projectId: string; feedbackToken: string; source: "active-memory" }
 interface Investigation { startedAt: number; cause: string; toolResults: number; startEntryCount?: number }
 const SUPPORTED_MEMORY_KINDS: MemoryKind[] = ["user_profile", "fact", "skill_workflow"];
 const STEER_TOOL_NAME = "memory_steer";
@@ -34,71 +38,121 @@ const NOOP_TUI = { requestRender() {} } as unknown as TUI;
 const BUILT_IN_EMBEDDING_ADAPTERS = new Set(["openai", "openai-compatible", "ollama"]);
 const EMBEDDING_BATCH_SIZE = 64;
 
-async function ensureEmbeddingCompatibility(
+function isExpectedAbort(error: unknown, signal?: AbortSignal): boolean {
+  return Boolean(signal?.aborted) || (error instanceof Error && error.name === "AbortError");
+}
+
+function metadataKeyForStore(store: VectorStore, rag: ActiveMemoryConfig["providers"]["rag"]): string {
+  return store instanceof QdrantVectorStore ? store.metadataStoreKey() : embeddingStoreKey(rag);
+}
+
+export async function ensureEmbeddingCompatibility(
   ctx: ExtensionContext,
   store: VectorStore,
   embedder: EmbeddingProvider,
   rag: ActiveMemoryConfig["providers"]["rag"],
+  metadataPath = join(getAgentDir(), "active-memory", "embedding-models.json"),
+  isCurrent: () => boolean = () => true,
 ): Promise<boolean> {
-  const current = embeddingModels(embedder);
-  const metadataPath = join(getAgentDir(), "active-memory", "embedding-models.json");
-  const key = embeddingStoreKey(rag);
-  let stored = await readEmbeddingModels(metadataPath, key);
-  const records = await (store.listAll?.() ?? store.list({}, 100000));
-
-  if (!stored) {
-    const legacyModels = [...new Set(records.map((record) => record.embeddingModel).filter(Boolean))];
-    if (legacyModels.length === 0) {
-      await writeEmbeddingModels(metadataPath, key, current);
-      return true;
-    }
-    const legacy = legacyModels.length === 1 ? legacyModels[0]! : `mixed:${legacyModels.join(",")}`;
-    stored = { query: legacy, document: legacy };
-    if (sameEmbeddingModels(stored, current)) {
-      await writeEmbeddingModels(metadataPath, key, current);
-      return true;
-    }
-  }
-
-  if (sameEmbeddingModels(stored, current)) return true;
-  const change = `query ${stored.query} → ${current.query}; document ${stored.document} → ${current.document}`;
-  ctx.ui.notify(`Active Memory embedding models changed: ${change}`, "warning");
-  if (!ctx.hasUI || !await ctx.ui.confirm("Re-embed Active Memory?", `${change}\n\nRe-embed all memories now? Declining deactivates the plugin for this session.`)) {
-    ctx.ui.notify("Active Memory deactivated because stored vectors use different embedding models", "error");
-    return false;
-  }
-
-  ctx.ui.setWorkingMessage("Re-embedding memories…");
+  const notify = (message: string, level: "info" | "warning" | "error") => { if (isCurrent()) ctx.ui.notify(message, level); };
+  const setWorkingMessage = (message?: string) => { if (isCurrent()) ctx.ui.setWorkingMessage(message); };
+  const confirm = (title: string, message: string) => isCurrent() ? ctx.ui.confirm(title, message) : Promise.resolve(false);
+  const requireCurrent = () => { if (!isCurrent()) throw new Error("Embedding compatibility superseded by a newer session"); };
   try {
-    const rows: Array<{ record: MemoryRecord; vector: number[] }> = [];
-    for (let offset = 0; offset < records.length; offset += EMBEDDING_BATCH_SIZE) {
-      const batch = records.slice(offset, offset + EMBEDDING_BATCH_SIZE);
-      const vectors = await embedDocuments(embedder, batch.map((record) => record.text));
-      if (vectors.length !== batch.length) throw new Error("Embedding provider returned an unexpected number of vectors");
-      rows.push(...batch.map((record, index) => ({
-        record: { ...record, embeddingModel: current.document },
-        vector: vectors[index]!,
-      })));
-    }
-    if (store.replaceAll) await store.replaceAll(rows);
-    else for (const row of rows) await store.upsert(row.record, row.vector);
-    await writeEmbeddingModels(metadataPath, key, current);
-    ctx.ui.notify(`Re-embedded ${records.length} memories`, "info");
-    return true;
-  } catch (error) {
-    ctx.ui.notify(`Active Memory re-embedding failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    if (!isCurrent()) return false;
+    const desired = embeddingModels(embedder);
+    const configuredKey = embeddingStoreKey(rag);
+    const key = metadataKeyForStore(store, rag);
+    const legacyKey = legacyEmbeddingStoreKey(rag);
+    // A configured Qdrant alias is not store identity. Once Qdrant resolves it
+    // to a physical collection, only the physical key owns metadata; alias-keyed
+    // entries could otherwise split one backing store into separate generations.
+    const keys = key === configuredKey ? [...new Set([key, legacyKey])] : [key];
+    return await withEmbeddingMigrationLocks(metadataPath, keys, async () => {
+      requireCurrent();
+      let generation = await readEmbeddingGeneration(metadataPath, key);
+      requireCurrent();
+      if (!generation && legacyKey !== key) generation = await readEmbeddingGeneration(metadataPath, legacyKey);
+      if (generation) await writeEmbeddingGenerationAliases(metadataPath, keys, generation, isCurrent);
+      const modelsInStore = async () => {
+        const models = new Set<string>();
+        let count = 0;
+        await store.scan({}, async page => { requireCurrent(); for (const record of page) { count++; models.add(record.embeddingModel); } });
+        requireCurrent();
+        return { models, count };
+      };
+      const rebuild = async (target: EmbeddingModels) => {
+        requireCurrent();
+        const [probe] = await embedDocuments(embedder, ["Active Memory embedding dimension probe"]);
+        requireCurrent();
+        if (!probe?.length) throw new Error("Embedding provider did not return a dimension probe");
+        const count = await store.rebuildVectors(probe.length, async batch => {
+          requireCurrent();
+          const vectors = await embedDocuments(embedder, batch.map(record => record.text));
+          requireCurrent();
+          if (vectors.length !== batch.length) throw new Error("Embedding provider returned an unexpected number of vectors");
+          return batch.map((record, index) => ({ record: { ...record, embeddingModel: target.document }, vector: vectors[index]! }));
+        });
+        requireCurrent();
+        return count;
+      };
+      if (generation?.pending) {
+        const observed = await modelsInStore();
+        const all = (model: string) => observed.count > 0 && observed.models.size === 1 && observed.models.has(model);
+        if (all(generation.pending.document)) {
+          // This is the crash window after vector publication and before metadata completion.
+          await writeEmbeddingGenerationAliases(metadataPath, keys, { current: generation.pending }, isCurrent);
+          generation = { current: generation.pending };
+        } else {
+          // The pending label is meaningful only with the provider that generated it.
+          // Never tag vectors from a differently configured embedder as that target.
+          if (!sameEmbeddingModels(generation.pending, desired)) {
+            notify("Active Memory has an unfinished embedding migration for different models; restore that model configuration to recover it", "error");
+            return false;
+          }
+          setWorkingMessage("Recovering Active Memory embedding migration…");
+          const count = await rebuild(generation.pending);
+          await writeEmbeddingGenerationAliases(metadataPath, keys, { current: generation.pending }, isCurrent);
+          notify(`Re-embedded ${count} memories`, "info");
+          generation = { current: generation.pending };
+        }
+      }
+      if (!generation) {
+        const observed = await modelsInStore();
+        if (observed.count === 0) { await writeEmbeddingGenerationAliases(metadataPath, keys, { current: desired }, isCurrent); return true; }
+        const legacyDocument = observed.models.size === 1 ? [...observed.models][0]! : `mixed:${[...observed.models].join(",")}`;
+        // Only document vectors are persisted. With no metadata owned by this
+        // store, infer the document generation from those vectors and bind the
+        // non-persisted query generation to the configured query model. Never
+        // borrow generation evidence from another store's metadata.
+        generation = { current: { query: desired.query, document: legacyDocument } };
+        if (sameEmbeddingModels(generation.current, desired)) { await writeEmbeddingGenerationAliases(metadataPath, keys, { current: desired }, isCurrent); return true; }
+      }
+      if (sameEmbeddingModels(generation.current, desired)) { await writeEmbeddingGenerationAliases(metadataPath, keys, { current: desired }, isCurrent); return true; }
+      const change = `query ${generation.current.query} → ${desired.query}; document ${generation.current.document} → ${desired.document}`;
+      notify(`Active Memory embedding models changed: ${change}`, "warning");
+      if (!ctx.hasUI || !await confirm("Re-embed Active Memory?", `${change}\n\nRe-embed all memories now? Declining deactivates the plugin for this session.`)) {
+        notify("Active Memory deactivated because stored vectors use different embedding models", "error");
+        return false;
+      }
+      requireCurrent();
+      setWorkingMessage("Re-embedding memories…");
+      await writeEmbeddingGenerationAliases(metadataPath, keys, { current: generation.current, pending: desired }, isCurrent);
+      const count = await rebuild(desired);
+      await writeEmbeddingGenerationAliases(metadataPath, keys, { current: desired }, isCurrent);
+      notify(`Re-embedded ${count} memories`, "info");
+      return true;
+    });
+  } catch {
+    // Adapter errors may contain credentials, endpoints, or opaque config values.
+    notify("Active Memory embedding compatibility failed; check provider and store configuration", "error");
     return false;
-  } finally {
-    ctx.ui.setWorkingMessage();
-  }
-}
-
-function sameEmbeddingModels(left: EmbeddingModels, right: EmbeddingModels): boolean {
-  return left.query === right.query && left.document === right.document;
+  } finally { setWorkingMessage(); }
 }
 
 export default function activeMemoryExtension(pi: ExtensionAPI) {
   let generation = 0;
+  let readyGeneration = 0;
   let config: ActiveMemoryConfig | undefined;
   let store: VectorStore | undefined;
   let activity: ActivityLogger | undefined;
@@ -106,7 +160,8 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   let engine: MemoryEngine | undefined;
   let projectId = "uninitialized";
   let paused = false;
-  const captureQueue = new DeferredSerialQueue();
+  let captureQueue = new DeferredSerialQueue();
+  let recallDrain: Promise<void> | undefined;
   let initialRecallPrompt: string | undefined;
   let steerLimiter: MemorySteerLimiter | undefined;
   let feedbackLedger = new SteerFeedbackLedger();
@@ -126,6 +181,31 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   const footerStatus = new ActiveMemoryFooterStatus();
   let dailySweepTimer: ReturnType<typeof setInterval> | undefined;
   let currentCwd = process.cwd();
+  let startupTail: Promise<void> = Promise.resolve();
+  const runtimeOperations = new Set<Promise<void>>();
+  const runtimeUiCancels = new Set<() => void>();
+  const cancelRuntimeUi = () => { for (const cancel of [...runtimeUiCancels]) { try { cancel(); } catch {} } runtimeUiCancels.clear(); };
+  const runtimeIsPublished = () => readyGeneration === generation;
+  const requireRuntimeGeneration = (taskGeneration: number, operation: string) => {
+    if (taskGeneration !== generation || !runtimeIsPublished()) throw new Error(`${operation} was cancelled because the session changed`);
+  };
+  const runRuntimeOperation = async <T>(taskGeneration: number, label: string, operation: () => Promise<T>): Promise<T> => {
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    runtimeOperations.add(pending);
+    try {
+      try {
+        const result = await operation();
+        requireRuntimeGeneration(taskGeneration, label);
+        return result;
+      } catch (error) {
+        // A stale adapter error may contain data from the prior project. Replace
+        // it with the fixed generation-cancellation diagnostic before it escapes.
+        requireRuntimeGeneration(taskGeneration, label);
+        throw error;
+      }
+    } finally { runtimeOperations.delete(pending); finish(); }
+  };
 
   const setStatus = (ctx: ExtensionContext) => {
     if (!ctx.hasUI) return;
@@ -187,34 +267,76 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    currentCwd = ctx.cwd;
-    if (ctx.mode === "tui") footerStatus.install();
     const thisGeneration = ++generation;
-    paused = false; turns = 0; turnSequence = 0; toolResults = 0; thinkingCharacters = 0; lastError = undefined; investigation = undefined; initialRecallPrompt = undefined; fastModelTokenUsageAvailable = false;
-    config = await loadConfig(ctx.cwd, ctx.isProjectTrusted());
-    if (BUILT_IN_EMBEDDING_ADAPTERS.has(config.providers.embedding.adapter)) {
-      try {
-        configuredEmbeddingModels(config.providers.embedding.config);
-      } catch (error) {
-        paused = true;
-        lastError = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`Active Memory configuration error: ${lastError}`, "error");
-        setStatus(ctx);
-        return;
-      }
+    // Fence event handlers immediately, even while this generation waits for a
+    // prior startup/shutdown lifecycle transaction to finish.
+    paused = true;
+    readyGeneration = 0;
+    cancelRuntimeUi();
+    recallPending = undefined;
+    captureQueue.abort("session changed");
+    // Hide the prior project immediately. Resource retirement remains serialized
+    // below, but commands, tools, prompts, and status must not observe it while a
+    // cancellation-insensitive task is still draining.
+    config = undefined;
+    projectId = "uninitialized";
+    feedbackLedger = new SteerFeedbackLedger();
+    feedbackBySteer.clear();
+    lastSteerAt = 0; lastSteerFingerprint = ""; lastRecall = undefined;
+    capturedCount = 0; sessionStats = emptySessionStats(); recallInFlight = false;
+    turns = 0; turnSequence = 0; toolResults = 0; thinkingCharacters = 0; lastError = undefined;
+    investigation = undefined; initialRecallPrompt = undefined; fastModelTokenUsageAvailable = false;
+    ctx.ui.setWorkingMessage();
+    ctx.ui.setStatus("active-memory-compaction", undefined);
+    if (ctx.mode === "tui") footerStatus.install(); else footerStatus.restore();
+    setStatus(ctx);
+    const previousStartup = startupTail;
+    let releaseStartup!: () => void;
+    startupTail = new Promise<void>(resolve => { releaseStartup = resolve; });
+    await previousStartup.catch(() => {});
+    if (thisGeneration !== generation) { releaseStartup(); return; }
+    try {
+    // session_start is not always preceded by session_shutdown. Fully retire the
+    // prior generation before replacing any shared runtime resource.
+    if (dailySweepTimer) clearInterval(dailySweepTimer);
+    dailySweepTimer = undefined;
+    await stopAutomation("session changed");
+    await store?.close().catch(() => {});
+    await activity?.flush();
+    store = undefined; activity = undefined; embedder = undefined; engine = undefined; config = undefined; steerLimiter = undefined; recallPending = undefined; recallDrain = undefined;
+    if (thisGeneration !== generation) return;
+    currentCwd = ctx.cwd;
+    projectId = "uninitialized";
+    feedbackLedger = new SteerFeedbackLedger();
+    feedbackBySteer.clear();
+    lastSteerAt = 0; lastSteerFingerprint = ""; lastRecall = undefined;
+    capturedCount = 0; sessionStats = emptySessionStats(); recallInFlight = false;
+    if (ctx.mode === "tui") footerStatus.install();
+    captureQueue = new DeferredSerialQueue();
+    turns = 0; turnSequence = 0; toolResults = 0; thinkingCharacters = 0; lastError = undefined; investigation = undefined; initialRecallPrompt = undefined; fastModelTokenUsageAvailable = false;
+    try {
+      config = await loadConfig(ctx.cwd, ctx.isProjectTrusted());
+    } catch (error) {
+      if (thisGeneration !== generation) return;
+      paused = true;
+      lastError = "Active Memory configuration is invalid";
+      ctx.ui.notify(lastError, "error");
+      setStatus(ctx);
+      return;
     }
+    try {
+    if (BUILT_IN_EMBEDDING_ADAPTERS.has(config.providers.embedding.adapter)) configuredEmbeddingModels(config.providers.embedding.config);
     dailySweepGate.reset();
     steerLimiter = new MemorySteerLimiter(config.recall);
     feedbackLedger = new SteerFeedbackLedger();
     feedbackBySteer.clear();
     const branch = ctx.sessionManager.getBranch();
     sessionStats = sessionStatsFromEntries(branch);
-    for (const entry of branch) {
-      const message = entry.type === "message" ? entry.message : undefined;
-      if (message?.role !== "toolResult" || message.toolName !== "memory_feedback") continue;
-      const details = message.details as { accepted?: boolean; steerToken?: string; memoryId?: string; outcome?: SteerFeedbackOutcome } | undefined;
-      if (details?.accepted && details.steerToken && details.memoryId && details.outcome) recordDisplayedFeedback(details.steerToken, details.memoryId, details.outcome);
-    }
+    const restored = restoreSessionState(branch, config, feedbackLedger, steerLimiter, recordDisplayedFeedback, details => fingerprint(details as SteerDetails, details.instruction ?? ""));
+    turnSequence = restored.turnSequence;
+    lastSteerAt = restored.lastSteerAt;
+    lastSteerFingerprint = restored.lastSteerFingerprint;
+    lastRecall = restored.lastRecall as SteerDetails | undefined;
     if (!config.enabled) { paused = true; setStatus(ctx); return; }
     const remote = await pi.exec("git", ["config", "--get", "remote.origin.url"], { timeout: 3000 }).catch(() => undefined);
     projectId = stableProjectId(ctx.cwd, remote?.stdout);
@@ -235,16 +357,30 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     };
     store = await adapters.createRag(config.providers.rag, adapterContext);
     await store.initialize();
+    if (thisGeneration !== generation) {
+      await store.close().catch(() => {});
+      store = undefined;
+      return;
+    }
+    embedder = await adapters.createEmbedding(config.providers.embedding, adapterContext);
     const migratedProvenance = await store.migrateLegacyProvenance();
     if (migratedProvenance) activity.log("provenance.migrated", { records: migratedProvenance });
-    if (thisGeneration !== generation) return;
-    embedder = await adapters.createEmbedding(config.providers.embedding, adapterContext);
+    if (thisGeneration !== generation) {
+      await store.close().catch(() => {});
+      store = undefined; embedder = undefined;
+      return;
+    }
     let embeddingsCompatible = false;
     try {
-      embeddingsCompatible = await ensureEmbeddingCompatibility(ctx, store, embedder, config.providers.rag);
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(`Active Memory embedding error: ${lastError}`, "error");
+      embeddingsCompatible = await ensureEmbeddingCompatibility(ctx, store, embedder, config.providers.rag, undefined, () => thisGeneration === generation);
+    } catch {
+      lastError = "embedding compatibility failed";
+      ctx.ui.notify("Active Memory embedding compatibility failed; check provider and store configuration", "error");
+    }
+    if (thisGeneration !== generation) {
+      await store.close().catch(() => {});
+      store = undefined; embedder = undefined;
+      return;
     }
     if (!embeddingsCompatible) {
       paused = true;
@@ -255,23 +391,69 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       setStatus(ctx);
       return;
     }
+    const guardedMetadataKey = metadataKeyForStore(store, config.providers.rag);
+    store = guardEmbeddingGeneration(store, join(getAgentDir(), "active-memory", "embedding-models.json"), guardedMetadataKey, embeddingModels(embedder));
+    if (thisGeneration !== generation) {
+      await store.close().catch(() => {});
+      store = undefined; embedder = undefined;
+      return;
+    }
     const fast: FastModelRunner = await adapters.createLlm(config.providers.llm, adapterContext);
+    if (thisGeneration !== generation) {
+      await store.close().catch(() => {});
+      store = undefined; embedder = undefined;
+      return;
+    }
     fastModelTokenUsageAvailable = typeof fast.onTokenUsage === "function";
+    const callbackGeneration = thisGeneration;
     fast.onTokenUsage?.(({ input, output }) => {
+      if (callbackGeneration !== generation || readyGeneration !== callbackGeneration) return;
       incrementSessionStat("fastModelInputTokens", input);
       incrementSessionStat("fastModelOutputTokens", output);
     });
     engine = new MemoryEngine(config, store, embedder, fast, projectId, ctx.sessionManager.getSessionId(), ctx.cwd, (type, data) => {
+      if (callbackGeneration !== generation || readyGeneration !== callbackGeneration) return;
       activity?.log(type, data);
       if (type === "capture.stored" && typeof data === "object" && data !== null && (data as { created?: unknown }).created === true) {
         incrementSessionStat("memoriesCreated");
       }
     });
     const lifecycle = await engine.sweepLifecycle();
+    if (thisGeneration !== generation) {
+      await stopAutomation("session changed");
+      await store.close().catch(() => {});
+      store = undefined; engine = undefined; embedder = undefined;
+      return;
+    }
     if (lifecycle.expired) activity.log("lifecycle.sweep", lifecycle);
+    readyGeneration = thisGeneration;
+    paused = false;
     dailySweepTimer = setInterval(() => queueDailySweep(ctx), DAILY_SWEEP_POLL_INTERVAL_MS);
     dailySweepTimer.unref?.();
     setStatus(ctx);
+    } catch (error) {
+      // No partially initialized adapter may survive a failed startup or be used by
+      // a later session. Keep the user-facing status useful without exposing custom
+      // adapter configuration or credentials through arbitrary thrown messages.
+      paused = true;
+      readyGeneration = 0;
+      lastError = safeStartupFailureMessage(error);
+      activity?.log("session.start_failed", { category: "startup_failure" });
+      await cleanupFailedStartup({
+        timer: dailySweepTimer,
+        abort: reason => captureQueue.abort(reason),
+        closeStore: store ? () => store!.close() : undefined,
+        flushActivity: activity ? () => activity!.flush() : undefined,
+      }, error);
+      dailySweepTimer = undefined;
+      store = undefined; engine = undefined; embedder = undefined; activity = undefined; steerLimiter = undefined; recallPending = undefined;
+      if (thisGeneration !== generation) return;
+      ctx.ui.notify(`Active Memory ${lastError}`, "error");
+      setStatus(ctx);
+    }
+    } finally {
+      releaseStartup();
+    }
   });
 
   pi.on("input", (event, ctx) => {
@@ -280,17 +462,21 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     if (text && !investigation) investigation = { startedAt: Date.now(), cause: text.slice(0, 2000), toolResults: 0 };
     if (paused || !engine || !config?.capture.enabled || !text) return;
     const taskGeneration = generation;
-    captureQueue.enqueue(async () => {
+    captureQueue.enqueue(async signal => {
       if (taskGeneration !== generation || paused || !engine || !config) return;
+      const taskEngine = engine;
       const context = boundedContext(ctx.sessionManager.buildContextEntries(), config.capture.contextCharacters);
       try {
-        capturedCount += await engine.capture(text, context);
+        const captured = await taskEngine.capture(text, context, signal);
+        if (taskGeneration !== generation) return;
+        capturedCount += captured;
         lastError = undefined;
       } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error);
-        activity?.log("capture.error", { error: lastError });
+        if (taskGeneration !== generation || isExpectedAbort(error, signal)) return;
+        lastError = "capture failed";
+        activity?.log("capture.error", { category: "capture_failure" });
       }
-      setStatus(ctx);
+      if (taskGeneration === generation) setStatus(ctx);
     });
   });
 
@@ -339,16 +525,20 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     const context = boundedAssistantInvestigation(ctx.sessionManager.buildContextEntries().slice(completed.startEntryCount ?? 0), config.assistantCapture.contextCharacters);
     if (!context.trim()) return;
     const taskGeneration = generation;
-    captureQueue.enqueue(async () => {
+    captureQueue.enqueue(async signal => {
       if (taskGeneration !== generation || paused || !engine) return;
+      const taskEngine = engine;
       try {
-        capturedCount += await engine.captureAssistantInvestigation(context, completed.cause, elapsedMs);
+        const captured = await taskEngine.captureAssistantInvestigation(context, completed.cause, elapsedMs, signal);
+        if (taskGeneration !== generation) return;
+        capturedCount += captured;
         lastError = undefined;
       } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error);
-        activity?.log("assistant_capture.error", { error: lastError, elapsedMs, toolResults: completed.toolResults });
+        if (taskGeneration !== generation || isExpectedAbort(error, signal)) return;
+        lastError = "assistant capture failed";
+        activity?.log("assistant_capture.error", { category: "assistant_capture_failure", elapsedMs, toolResults: completed.toolResults });
       }
-      setStatus(ctx);
+      if (taskGeneration === generation) setStatus(ctx);
     });
   });
 
@@ -363,13 +553,25 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (event) => {
     footerStatus.restore();
     generation++;
+    readyGeneration = 0;
+    cancelRuntimeUi();
+    // Reserve the same lifecycle queue used by startup. A later session_start waits
+    // for this cleanup, while this shutdown never closes a store still being used
+    // by an earlier startup generation.
+    const previousLifecycle = startupTail;
+    let releaseLifecycle!: () => void;
+    startupTail = new Promise<void>(resolve => { releaseLifecycle = resolve; });
     if (dailySweepTimer) clearInterval(dailySweepTimer);
     dailySweepTimer = undefined;
-    activity?.log("session.shutdown", { reason: event.reason });
-    await captureQueue.drain().catch(() => {});
-    await store?.close().catch(() => {});
-    await activity?.flush();
-    store = undefined; activity = undefined; embedder = undefined; engine = undefined; steerLimiter = undefined; recallPending = undefined; investigation = undefined; initialRecallPrompt = undefined;
+    try {
+      await stopAutomation(event.reason);
+      await previousLifecycle.catch(() => {});
+      activity?.log("session.shutdown", { reason: event.reason });
+      await store?.close().catch(() => {});
+      await activity?.flush();
+      store = undefined; activity = undefined; embedder = undefined; engine = undefined; config = undefined; steerLimiter = undefined; recallPending = undefined; investigation = undefined; initialRecallPrompt = undefined;
+      projectId = "uninitialized"; lastRecall = undefined; feedbackBySteer.clear(); capturedCount = 0; sessionStats = emptySessionStats();
+    } finally { releaseLifecycle(); }
   });
 
   function queueDailySweep(ctx: ExtensionContext, now = new Date()): void {
@@ -377,8 +579,8 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     const date = dailySweepGate.claim(now);
     if (!date) return;
     const taskGeneration = generation;
-    captureQueue.enqueue(async () => {
-      if (taskGeneration !== generation || paused || !engine) {
+    captureQueue.enqueue(async signal => {
+      if (signal.aborted || taskGeneration !== generation || paused || !engine) {
         dailySweepGate.complete(date, false);
         return;
       }
@@ -389,8 +591,9 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
         lastError = undefined;
       } catch (error) {
         dailySweepGate.complete(date, false);
-        lastError = error instanceof Error ? error.message : String(error);
-        activity?.log("lifecycle.sweep_error", { utcDate: date, error: lastError });
+        if (isExpectedAbort(error, signal)) return;
+        lastError = "lifecycle sweep failed";
+        activity?.log("lifecycle.sweep_error", { utcDate: date, category: "lifecycle_sweep_failure" });
       }
       setStatus(ctx);
     });
@@ -401,7 +604,15 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     recallPending = { ctx, context, activeContext, generation };
     activity?.log("recall.scheduled", { contextCharacters: context.length, coalesced: recallInFlight });
     if (recallInFlight) return;
-    void drainRecall();
+    recallDrain = drainRecall();
+    void recallDrain;
+  }
+
+  async function stopAutomation(reason?: unknown): Promise<void> {
+    paused = true;
+    recallPending = undefined;
+    captureQueue.abort(reason);
+    await Promise.all([captureQueue.drain().catch(() => {}), recallDrain?.catch(() => {}), ...[...runtimeOperations].map(operation => operation.catch(() => {}))]);
   }
 
   async function drainRecall(): Promise<void> {
@@ -420,8 +631,9 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
         try {
           const suppressedIds = steerLimiter?.suppressedIds(Date.now(), turnSequence) ?? new Set<string>();
           incrementSessionStat("recallAttempts");
-          const recalled = await engine.recall(job.context, job.ctx.signal, suppressedIds, job.activeContext);
-          if (!recalled || job.generation !== generation) continue;
+          const signal = AbortSignal.any([job.ctx.signal ?? new AbortController().signal, captureQueue.signal]);
+          const recalled = await engine.recall(job.context, signal, suppressedIds, job.activeContext);
+          if (!recalled || job.generation !== generation || paused || signal.aborted) continue;
           const details = makeDetails(recalled, projectId);
           const surfacedText = recalled.relevant.map((match) => match.record.text).join(" ");
           if (isDuplicateSteer(details, surfacedText)) continue;
@@ -440,11 +652,13 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           );
           pi.sendMessage({ customType: "active-memory-steer", content, display: true, details }, { deliverAs: delivery, triggerTurn: false });
           incrementSessionStat("memorySteers");
-          activity?.log("steer.queued", { delivery, ...details, ...(config.activityLog.includeText ? { memories: recalled.relevant.map((match) => match.record.text) } : {}) });
+          activity?.log("steer.queued", { delivery, memoryIds: details.memoryIds, scores: details.scores, projectId: details.projectId, feedbackToken: details.feedbackToken, source: details.source, ...(config.activityLog.includeText ? { reason: details.reason, instruction: details.instruction, memories: recalled.relevant.map((match) => match.record.text) } : {}) });
+          await engine.recordRecallDelivery(recalled.relevant.map(match => match.record));
           lastError = undefined;
         } catch (error) {
-          lastError = error instanceof Error ? error.message : String(error);
-          activity?.log("recall.error", { phase: "background", error: lastError });
+          if (isExpectedAbort(error, captureQueue.signal)) continue;
+          lastError = "recall failed";
+          activity?.log("recall.error", { phase: "background", category: "recall_failure" });
         }
       }
     } finally {
@@ -462,7 +676,7 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     outcomes.set(memoryId, outcome);
     feedbackBySteer.set(steerToken, outcomes);
   }
-  function fingerprint(details: SteerDetails, instruction: string): string { return `${details.memoryIds.sort().join(",")}|${instruction.toLowerCase()}`; }
+  function fingerprint(details: SteerDetails, instruction: string): string { return `${[...details.memoryIds].sort().join(",")}|${instruction.toLowerCase()}`; }
   function isDuplicateSteer(details: SteerDetails, instruction: string): boolean { return fingerprint(details, instruction) === lastSteerFingerprint; }
   function rememberSteer(details: SteerDetails, instruction: string): void {
     const now = Date.now();
@@ -471,18 +685,22 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     steerLimiter?.record(details.memoryIds, now, turnSequence);
   }
 
-  async function visibleMemories(): Promise<MemoryRecord[]> {
-    if (!store) return [];
-    const rows = await store.list({ scopes: ["global", "project"], kinds: SUPPORTED_MEMORY_KINDS, projectId }, 10000);
+  type PublishedRuntime = { generation: number; store: VectorStore; embedder: EmbeddingProvider; engine: MemoryEngine; config: ActiveMemoryConfig; projectId: string };
+  function publishedRuntime(): PublishedRuntime | undefined {
+    return runtimeIsPublished() && store && embedder && engine && config ? { generation, store, embedder, engine, config, projectId } : undefined;
+  }
+
+  async function visibleMemories(runtime: PublishedRuntime): Promise<MemoryRecord[]> {
+    const rows = await runRuntimeOperation(runtime.generation, "Memory listing", () => runtime.store.list({ scopes: ["global", "project"], kinds: SUPPORTED_MEMORY_KINDS, projectId: runtime.projectId }, 10000));
     return rows.filter((record) => record.status !== "deleted");
   }
 
-  async function pickMemory(ctx: ExtensionContext): Promise<MemoryRecord | undefined> {
+  async function pickMemory(ctx: ExtensionContext, runtime: PublishedRuntime): Promise<MemoryRecord | undefined> {
     if (ctx.mode !== "tui") {
       ctx.ui.notify("The memory finder requires TUI mode", "warning");
       return undefined;
     }
-    const rows = await visibleMemories();
+    const rows = await visibleMemories(runtime);
     if (!rows.length) {
       ctx.ui.notify("No editable memories", "info");
       return undefined;
@@ -506,12 +724,16 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
         cachedLines = undefined;
         tui.requestRender();
       };
+      let cancelRuntime = () => {};
       const finish = (record?: MemoryRecord) => {
+        runtimeUiCancels.delete(cancelRuntime);
         searchGeneration++;
         if (searchTimer) clearTimeout(searchTimer);
         searchController?.abort();
         done(record);
       };
+      cancelRuntime = () => finish();
+      runtimeUiCancels.add(cancelRuntime);
       const scheduleSearch = () => {
         const query = input.getValue().trim();
         const generation = ++searchGeneration;
@@ -533,13 +755,14 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           const controller = new AbortController();
           searchController = controller;
           void (async () => {
-            const [vector] = await embedQuery(embedder!, [query], controller.signal);
+            requireRuntimeGeneration(runtime.generation, "Memory finder");
+            const [vector] = await runRuntimeOperation(runtime.generation, "Memory finder", () => embedQuery(runtime.embedder, [query], controller.signal));
             if (!vector) throw new Error("Embedding failed");
-            const found = await store!.search(vector, {
+            const found = await runRuntimeOperation(runtime.generation, "Memory finder", () => runtime.store.search(vector, {
               scopes: ["global", "project"],
               kinds: SUPPORTED_MEMORY_KINDS,
-              projectId,
-            }, 10000);
+              projectId: runtime.projectId,
+            }, 10000));
             if (generation !== searchGeneration) return;
             const visible = found.filter((match) => match.record.status !== "deleted");
             matches = visible.map((match) => match.record);
@@ -617,19 +840,19 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
     });
   }
 
-  async function editMemory(ctx: ExtensionContext, record: MemoryRecord): Promise<boolean> {
-    if (!store || !embedder || !config) return false;
+  async function editMemory(ctx: ExtensionContext, record: MemoryRecord, runtime: PublishedRuntime): Promise<boolean> {
     let draft = JSON.stringify({
       text: record.text,
       kind: record.kind,
       scope: record.scope,
-      projectId: record.scope === "project" ? record.projectId ?? projectId : null,
+      projectId: record.scope === "project" ? record.projectId ?? runtime.projectId : null,
       confidence: record.confidence,
-      priority: record.priority ?? (record.source.actor === "assistant" ? config.assistantCapture.priority : 1),
+      priority: record.priority ?? (record.source.actor === "assistant" ? runtime.config.assistantCapture.priority : 1),
       status: record.status,
     }, null, 2);
     while (true) {
       const edited = await ctx.ui.editor(`Edit memory ${record.id}`, draft);
+      requireRuntimeGeneration(runtime.generation, "Memory editing");
       if (edited === undefined) return false;
       try {
         const value = JSON.parse(edited) as Partial<MemoryRecord>;
@@ -642,71 +865,96 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
         if (typeof value.priority !== "number" || !Number.isFinite(value.priority) || value.priority < 0 || value.priority > 1) throw new Error("priority must be a number from 0 to 1");
         if (value.status === "deleted" && record.status !== "deleted") {
           const confirmed = await ctx.ui.confirm("Delete memory?", `${value.text.trim()}\n\n${record.id}`);
+          requireRuntimeGeneration(runtime.generation, "Memory editing");
           if (!confirmed) return false;
         }
-        let text = value.text.trim().slice(0, config.security.maxMemoryCharacters);
-        if (config.security.redactSecrets) text = redactSecrets(text);
+        const text = sanitizePersistedText(value.text, runtime.config.security.maxMemoryCharacters, runtime.config.security.redactSecrets);
         const next: MemoryRecord = {
           ...record,
           text,
           kind: value.kind as MemoryKind,
           scope: value.scope,
-          ...(value.scope === "project" ? { projectId: typeof value.projectId === "string" && value.projectId.trim() ? value.projectId.trim() : projectId } : { projectId: undefined }),
+          ...(value.scope === "project" ? { projectId: typeof value.projectId === "string" && value.projectId.trim() ? value.projectId.trim() : runtime.projectId } : { projectId: undefined }),
           confidence: value.confidence,
           priority: value.priority,
           status: value.status,
           updatedAt: new Date().toISOString(),
-          embeddingModel: embeddingModels(embedder).document,
+          embeddingModel: embeddingModels(runtime.embedder).document,
         };
-        const [vector] = await embedDocuments(embedder, [next.text]);
-        if (!vector) throw new Error("Embedding failed");
-        await store.upsert(next, vector);
-        activity?.log("memory.edited", { id: next.id, kind: next.kind, scope: next.scope, status: next.status, confidence: next.confidence, priority: next.priority, actor: next.source.actor ?? "user", ...(config.activityLog.includeText ? { text: next.text } : {}) });
-        ctx.ui.notify(`Updated ${next.id}`, "info");
+        const textChanged = next.text !== record.text || next.embeddingModel !== record.embeddingModel;
+        const [vector] = textChanged ? await runRuntimeOperation(runtime.generation, "Memory editing", () => embedDocuments(runtime.embedder, [next.text])) : [];
+        if (textChanged && !vector) throw new Error("Embedding failed");
+        const mutation = await runRuntimeOperation(runtime.generation, "Memory editing", () => runtime.store.mutate(record.id, latest => {
+          // Preserve independently changed fields when this editor left them untouched;
+          // refuse same-field conflicts rather than silently clobbering a newer edit.
+          for (const field of ["text", "kind", "scope", "projectId", "confidence", "priority", "status"] as const) {
+            if (next[field] !== record[field] && latest[field] !== record[field] && latest[field] !== next[field]) throw new Error(`Memory ${field} changed while editing; reopen the editor`);
+          }
+          const merged = { ...latest, ...Object.fromEntries((["text", "kind", "scope", "projectId", "confidence", "priority", "status"] as const).map(field => [field, next[field] === record[field] ? latest[field] : next[field]])), updatedAt: next.updatedAt, embeddingModel: next.embeddingModel } as MemoryRecord;
+          return { record: merged, ...(merged.text !== latest.text || merged.embeddingModel !== latest.embeddingModel ? { vector } : {}) };
+        }));
+        if (mutation.status !== "updated" || !mutation.record) throw new Error("Memory was deleted while editing");
+        const committed = mutation.record;
+        if (runtime.generation === generation) activity?.log("memory.edited", { id: committed.id, kind: committed.kind, scope: committed.scope, status: committed.status, confidence: committed.confidence, priority: committed.priority, actor: committed.source.actor ?? "user", ...(runtime.config.activityLog.includeText ? { text: committed.text } : {}) });
+        requireRuntimeGeneration(runtime.generation, "Memory editing");
+        ctx.ui.notify(`Updated ${committed.id}`, "info");
         return true;
       } catch (error) {
+        requireRuntimeGeneration(runtime.generation, "Memory editing");
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         draft = edited;
       }
     }
   }
 
-  async function deleteMemory(ctx: ExtensionContext, record: MemoryRecord): Promise<boolean> {
-    if (!store) return false;
+  async function deleteMemory(ctx: ExtensionContext, record: MemoryRecord, runtime: PublishedRuntime): Promise<boolean> {
     const confirmed = await ctx.ui.confirm("Delete memory?", `${record.text}\n\n${record.id}`);
     if (!confirmed) return false;
-    const deleted = await store.markDeleted(record.id);
-    if (deleted) activity?.log("memory.deleted", { id: record.id });
+    requireRuntimeGeneration(runtime.generation, "Memory deletion");
+    const mutation = await runRuntimeOperation(runtime.generation, "Memory deletion", () => runtime.store.mutate(record.id, latest => ({ record: { ...latest, status: "deleted", updatedAt: new Date().toISOString() } })));
+    const deleted = mutation.status === "updated";
+    if (deleted && runtime.generation === generation) activity?.log("memory.deleted", { id: record.id });
+    requireRuntimeGeneration(runtime.generation, "Memory deletion");
     ctx.ui.notify(deleted ? `Soft-deleted ${record.id}` : `Memory ${record.id} not found`, deleted ? "info" : "warning");
     return deleted;
   }
 
-  async function findByIdOrPrefix(input: string): Promise<MemoryRecord | undefined> {
-    const matches = (await visibleMemories()).filter((record) => record.id === input || record.id.startsWith(input));
+  async function findByIdOrPrefix(input: string, runtime: PublishedRuntime): Promise<MemoryRecord | undefined> {
+    const matches = (await visibleMemories(runtime)).filter((record) => record.id === input || record.id.startsWith(input));
     return matches.length === 1 ? matches[0] : undefined;
   }
 
   pi.registerCommand("memory-status", {
     description: "Show active-memory health and configuration",
     handler: async (_args, ctx) => {
-      const count = store ? (await store.list({ status: "active", kinds: SUPPORTED_MEMORY_KINDS }, 100000)).length : 0;
-      ctx.ui.notify(JSON.stringify({ state: paused ? "paused" : "active", projectId, memories: count, capturedThisSession: capturedCount, sessionStats: displayedSessionStats(sessionStats, fastModelTokenUsageAvailable), recallInFlight, activityLog: activity?.path, lastRecall, lastError, config: config && publicConfig(config) }, null, 2), lastError ? "warning" : "info");
+      const published = runtimeIsPublished();
+      const taskGeneration = generation;
+      const taskStore = store;
+      const taskProjectId = projectId;
+      const count = published && taskStore ? (await runRuntimeOperation(taskGeneration, "Memory status", () => taskStore.list({ status: "active", scopes: ["global", "project"], kinds: SUPPORTED_MEMORY_KINDS, projectId: taskProjectId }, 100000))).length : 0;
+      if (taskGeneration !== generation) return;
+      ctx.ui.notify(JSON.stringify({ state: published && !paused ? "active" : "paused", projectId: published ? taskProjectId : "uninitialized", memories: count, capturedThisSession: published ? capturedCount : 0, sessionStats: displayedSessionStats(published ? sessionStats : emptySessionStats(), published && fastModelTokenUsageAvailable), recallInFlight: published && recallInFlight, activityLog: published ? activity?.path : undefined, lastRecall: published ? lastRecall : undefined, lastError, config: published && config ? publicConfig(config) : undefined }, null, 2), lastError ? "warning" : "info");
     },
   });
   pi.registerCommand("memory-stats", {
     description: "Show active-memory counters for the current session",
     handler: async (_args, ctx) => {
-      await captureQueue.drain().catch(() => {});
-      ctx.ui.notify(formatSessionStats(sessionStats, fastModelTokenUsageAvailable), "info");
+      const taskGeneration = generation;
+      if (runtimeIsPublished()) await captureQueue.drain().catch(() => {});
+      if (taskGeneration !== generation) return;
+      ctx.ui.notify(formatSessionStats(runtimeIsPublished() ? sessionStats : emptySessionStats(), runtimeIsPublished() && fastModelTokenUsageAvailable), "info");
     },
   });
   pi.registerCommand("memory-settings", {
     description: "Configure active-memory extension settings",
     handler: async (_args, ctx) => {
-      if (!config) return ctx.ui.notify("Active-memory configuration is not initialized", "warning");
+      if (!runtimeIsPublished() || !config) return ctx.ui.notify("Active-memory configuration is not initialized", "warning");
       if (ctx.mode !== "tui") return ctx.ui.notify("Memory settings require TUI mode", "warning");
+      const settingsGeneration = generation;
+      const settingsConfig = config;
+      const settingsActivity = activity;
       const values = ["0.3", "0.4", "0.5", "0.6", "0.7", "0.8", "0.9"];
-      const currentValue = config.compaction.similarityThreshold.toFixed(1);
+      const currentValue = settingsConfig.compaction.similarityThreshold.toFixed(1);
       if (!values.includes(currentValue)) values.push(currentValue);
       values.sort((left, right) => Number(left) - Number(right));
       const rateValues = ["0.00", "0.05", "0.10", "0.15", "0.20", "0.25", "0.28", "0.30", "0.40", "0.50"];
@@ -723,33 +971,47 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           id: "memoryLifecycle.decay.initialRate",
           label: "New-memory daily decay rate",
           description: "Daily fraction of confidence lost while unused",
-          currentValue: config.memoryLifecycle.decay.initialRate.toFixed(2),
+          currentValue: settingsConfig.memoryLifecycle.decay.initialRate.toFixed(2),
           values: rateValues,
         },
         {
           id: "memoryLifecycle.confidence.deletionThreshold",
           label: "Memory deletion confidence",
           description: "Soft-delete after daily decay or feedback drops confidence below this value",
-          currentValue: config.memoryLifecycle.confidence.deletionThreshold.toFixed(2),
+          currentValue: settingsConfig.memoryLifecycle.confidence.deletionThreshold.toFixed(2),
           values: thresholdValues,
         },
       ];
       await ctx.ui.custom((_tui, theme, _keybindings, done) => {
+        const finish = () => { runtimeUiCancels.delete(finish); done(undefined); };
+        runtimeUiCancels.add(finish);
         const container = new Container();
         container.addChild(new Text(theme.fg("accent", theme.bold("Active-memory settings")), 1, 1));
         const settings = new SettingsList(items, 7, getSettingsListTheme(), (id, value) => {
           const number = Number(value);
           if (id === "compaction.similarityThreshold") {
-            config!.compaction.similarityThreshold = number;
-            void saveUserCompactionThreshold(number).then(() => activity?.log("config.updated", { id, value: number, scope: "user" }))
-              .catch((error) => ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"));
+            void runRuntimeOperation(settingsGeneration, "Memory settings", async () => {
+              await saveUserCompactionThreshold(number, undefined, settingsConfig);
+              if (settingsGeneration !== generation) return;
+              const refreshed = await loadConfig(ctx.cwd, ctx.isProjectTrusted());
+              if (settingsGeneration !== generation) return;
+              settingsConfig.compaction.similarityThreshold = refreshed.compaction.similarityThreshold;
+              settingsActivity?.log("config.updated", { id, value: refreshed.compaction.similarityThreshold, requestedValue: number, scope: "user" });
+            }).catch((error) => { if (settingsGeneration === generation) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); });
             return;
           }
-          if (id === "memoryLifecycle.decay.initialRate") config!.memoryLifecycle.decay.initialRate = number;
-          if (id === "memoryLifecycle.confidence.deletionThreshold") config!.memoryLifecycle.confidence.deletionThreshold = number;
-          void saveUserMemoryLifecycle(config!.memoryLifecycle).then(() => activity?.log("config.updated", { id, value: number, scope: "user" }))
-            .catch((error) => ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"));
-        }, () => done(undefined));
+          const setting = id === "memoryLifecycle.decay.initialRate" ? "decay.initialRate" : "confidence.deletionThreshold";
+          void runRuntimeOperation(settingsGeneration, "Memory settings", async () => {
+            await saveUserMemoryLifecycleSetting(setting, number, undefined, settingsConfig);
+            if (settingsGeneration !== generation) return;
+            const refreshed = await loadConfig(ctx.cwd, ctx.isProjectTrusted());
+            if (settingsGeneration !== generation) return;
+            const effectiveValue = id === "memoryLifecycle.decay.initialRate" ? refreshed.memoryLifecycle.decay.initialRate : refreshed.memoryLifecycle.confidence.deletionThreshold;
+            if (id === "memoryLifecycle.decay.initialRate") settingsConfig.memoryLifecycle.decay.initialRate = effectiveValue;
+            else settingsConfig.memoryLifecycle.confidence.deletionThreshold = effectiveValue;
+            settingsActivity?.log("config.updated", { id, value: effectiveValue, requestedValue: number, scope: "user" });
+          }).catch((error) => { if (settingsGeneration === generation) ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); });
+        }, finish);
         container.addChild(settings);
         return {
           render: (width) => container.render(width),
@@ -759,57 +1021,82 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       });
     },
   });
-  pi.registerCommand("memory-pause", { description: "Pause automatic capture and recall", handler: async (_args, ctx) => { paused = true; activity?.log("automation.paused"); setStatus(ctx); } });
-  pi.registerCommand("memory-resume", { description: "Resume automatic capture and recall", handler: async (_args, ctx) => { paused = false; activity?.log("automation.resumed"); setStatus(ctx); } });
-  pi.registerCommand("memory-why", { description: "Explain the latest memory steer", handler: async (_args, ctx) => ctx.ui.notify(lastRecall ? JSON.stringify(lastRecall, null, 2) : "No memory steer yet", "info") });
+  pi.registerCommand("memory-pause", { description: "Pause automatic capture and recall", handler: async (_args, ctx) => {
+    if (!runtimeIsPublished()) { ctx.ui.notify("Active Memory is unavailable while a session is starting", "warning"); return; }
+    const taskGeneration = generation;
+    await stopAutomation("memory-pause");
+    requireRuntimeGeneration(taskGeneration, "Memory pause");
+    activity?.log("automation.paused"); setStatus(ctx);
+  } });
+  pi.registerCommand("memory-resume", { description: "Resume automatic capture and recall", handler: async (_args, ctx) => {
+    if (!runtimeIsPublished() || !config || !store || !engine) { ctx.ui.notify("Active Memory is unavailable; restart or fix configuration before resuming", "warning"); return; }
+    if (captureQueue.signal.aborted) captureQueue = new DeferredSerialQueue();
+    paused = false;
+    activity?.log("automation.resumed");
+    setStatus(ctx);
+  } });
+  pi.registerCommand("memory-why", { description: "Explain the latest memory steer", handler: async (_args, ctx) => ctx.ui.notify(runtimeIsPublished() && lastRecall ? JSON.stringify(lastRecall, null, 2) : "No memory steer yet", "info") });
   pi.registerCommand("memory-list", {
     description: "List active memories; argument can be global or project",
     handler: async (args, ctx) => {
-      if (!store) return ctx.ui.notify("Memory store is not initialized", "warning");
+      const runtime = publishedRuntime();
+      if (!runtime) return ctx.ui.notify("Memory store is not initialized", "warning");
       const scope = args.trim() === "global" || args.trim() === "project" ? args.trim() as MemoryScope : undefined;
-      const rows = await store.list({ status: "active", kinds: SUPPORTED_MEMORY_KINDS, ...(scope ? { scopes: [scope] } : {}), ...(scope === "project" ? { projectId } : {}) }, 100);
-      ctx.ui.notify(rows.length ? rows.map((m) => `${m.id} [${m.scope}/${m.kind}/${m.source.actor ?? "user"} confidence=${m.confidence.toFixed(2)} decay=${(m.decayRate ?? config?.memoryLifecycle.decay.initialRate ?? 0).toFixed(2)} lastDecay=${m.lifecycle?.lastDecayDate ?? "unmigrated"}] ${m.text}\n  cause: ${m.source.cause ?? "legacy record"}; why: ${m.source.reason ?? "not recorded"}; feedback: +${m.feedback?.useful ?? 0}/-${m.feedback?.unhelpful ?? 0}`).join("\n") : "No memories", "info");
+      const rows = await runRuntimeOperation(runtime.generation, "Memory listing", () => runtime.store.list({ status: "active", kinds: SUPPORTED_MEMORY_KINDS, scopes: scope ? [scope] : ["global", "project"], ...((scope === "project" || !scope) ? { projectId: runtime.projectId } : {}) }, 100));
+      requireRuntimeGeneration(runtime.generation, "Memory listing");
+      ctx.ui.notify(rows.length ? rows.map((m) => `${m.id} [${m.scope}/${m.kind}/${m.source.actor ?? "user"} confidence=${m.confidence.toFixed(2)} decay=${(m.decayRate ?? runtime.config.memoryLifecycle.decay.initialRate).toFixed(2)} lastDecay=${m.lifecycle?.lastDecayDate ?? "unmigrated"}] ${m.text}\n  cause: ${m.source.cause ?? "legacy record"}; why: ${m.source.reason ?? "not recorded"}; feedback: +${m.feedback?.useful ?? 0}/-${m.feedback?.unhelpful ?? 0}`).join("\n") : "No memories", "info");
     },
   });
   pi.registerCommand("memory", {
     description: "Semantically find a memory, then edit or delete it",
     handler: async (_args, ctx) => {
-      if (!store) return ctx.ui.notify("Memory store is not initialized", "warning");
+      const runtime = publishedRuntime();
+      if (!runtime) return ctx.ui.notify("Memory store is not initialized", "warning");
       await captureQueue.drain().catch(() => {});
-      const record = await pickMemory(ctx);
+      requireRuntimeGeneration(runtime.generation, "Memory management");
+      const record = await pickMemory(ctx, runtime);
+      requireRuntimeGeneration(runtime.generation, "Memory management");
       if (!record) return;
       const action = await ctx.ui.select("Memory action", ["Edit text and metadata", "Delete", "Cancel"]);
-      if (action === "Edit text and metadata") await editMemory(ctx, record);
-      if (action === "Delete") await deleteMemory(ctx, record);
+      requireRuntimeGeneration(runtime.generation, "Memory management");
+      if (action === "Edit text and metadata") await editMemory(ctx, record, runtime);
+      if (action === "Delete") await deleteMemory(ctx, record, runtime);
     },
   });
   pi.registerCommand("memory-edit", {
     description: "Semantically find and edit a memory, including its metadata",
     handler: async (_args, ctx) => {
-      if (!store) return ctx.ui.notify("Memory store is not initialized", "warning");
+      const runtime = publishedRuntime();
+      if (!runtime) return ctx.ui.notify("Memory store is not initialized", "warning");
       await captureQueue.drain().catch(() => {});
-      const record = await pickMemory(ctx);
-      if (record) await editMemory(ctx, record);
+      requireRuntimeGeneration(runtime.generation, "Memory editing");
+      const record = await pickMemory(ctx, runtime);
+      requireRuntimeGeneration(runtime.generation, "Memory editing");
+      if (record) await editMemory(ctx, record, runtime);
     },
   });
   pi.registerCommand("memory-forget", {
     description: "Semantically find and soft-delete a memory; an exact ID or unique prefix is optional",
     handler: async (args, ctx) => {
-      if (!store) return ctx.ui.notify("Memory store is not initialized", "warning");
+      const runtime = publishedRuntime();
+      if (!runtime) return ctx.ui.notify("Memory store is not initialized", "warning");
       await captureQueue.drain().catch(() => {});
+      requireRuntimeGeneration(runtime.generation, "Memory deletion");
       const input = args.trim();
-      const record = input ? await findByIdOrPrefix(input) : await pickMemory(ctx);
+      const record = input ? await findByIdOrPrefix(input, runtime) : await pickMemory(ctx, runtime);
+      requireRuntimeGeneration(runtime.generation, "Memory deletion");
       if (!record) {
         if (input) ctx.ui.notify(`No unique memory matching ${input}`, "warning");
         return;
       }
-      await deleteMemory(ctx, record);
+      await deleteMemory(ctx, record, runtime);
     },
   });
   pi.registerCommand("memory-compact", {
     description: "Review related memory pairs and combine selected pairs; never runs automatically",
     handler: async (_args, ctx) => {
-      if (!engine || !config) return ctx.ui.notify("Memory engine is not initialized", "warning");
+      const runtime = publishedRuntime();
+      if (!runtime) return ctx.ui.notify("Memory engine is not initialized", "warning");
       if (ctx.mode !== "tui") return ctx.ui.notify("Memory compaction requires TUI review", "warning");
       let terminalState: "completed" | "cancelled" | "error" = "completed";
       let applied = 0;
@@ -817,7 +1104,9 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
         ctx.ui.setStatus("active-memory-compaction", compactionProgressStatus("processing"));
         ctx.ui.setWorkingMessage("Finding and comparing related memories…");
         await captureQueue.drain();
-        const plan = await engine.planCompaction(ctx.signal);
+        requireRuntimeGeneration(runtime.generation, "Memory compaction");
+        const plan = await runRuntimeOperation(runtime.generation, "Memory compaction", () => runtime.engine.planCompaction(ctx.signal));
+        requireRuntimeGeneration(runtime.generation, "Memory compaction");
         ctx.ui.setWorkingMessage();
         if (!plan.clusters.length) {
           ctx.ui.notify("No related memory pairs found", "info");
@@ -832,7 +1121,11 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           const reviewed = await reviewCompactionPair(ctx, first.text, second.text, suggested.text, {
             current: index + 1,
             total: plan.clusters.length,
+          }, cancel => {
+            runtimeUiCancels.add(cancel);
+            return () => runtimeUiCancels.delete(cancel);
           });
+          requireRuntimeGeneration(runtime.generation, "Memory compaction");
           if (reviewed.action === "cancel") {
             terminalState = "cancelled";
             break;
@@ -841,7 +1134,8 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
           ctx.ui.setStatus("active-memory-compaction", compactionProgressStatus("applying", index + 1, plan.clusters.length));
           ctx.ui.setWorkingMessage("Validating and saving combined memory…");
           const proposal: CompactionProposal = { ...suggested, text: reviewed.text.trim() };
-          await engine.applyCompaction(proposal, cluster, ctx.signal);
+          await runRuntimeOperation(runtime.generation, "Memory compaction", () => runtime.engine.applyCompaction(proposal, cluster, ctx.signal));
+          requireRuntimeGeneration(runtime.generation, "Memory compaction");
           ctx.ui.setWorkingMessage();
           applied++;
         }
@@ -852,21 +1146,23 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
             : "Memory compaction finished: no memories combined";
         ctx.ui.notify(message, "info");
       } catch (error) {
+        if (runtime.generation !== generation) return;
         terminalState = "error";
-        const message = error instanceof Error ? error.message : String(error);
-        activity?.log("compaction.error", { error: message });
-        ctx.ui.notify(`Memory compaction failed: ${message}`, "error");
+        activity?.log("compaction.error", { category: "compaction_failure" });
+        ctx.ui.notify("Memory compaction failed; check Active Memory configuration and adapters", "error");
       } finally {
-        ctx.ui.setWorkingMessage();
-        ctx.ui.setStatus("active-memory-compaction", compactionProgressStatus(terminalState));
+        if (runtime.generation === generation) {
+          ctx.ui.setWorkingMessage();
+          ctx.ui.setStatus("active-memory-compaction", compactionProgressStatus(terminalState));
+        }
       }
     },
   });
 
   pi.registerTool({
     name: "memory_store_result", label: "Store Hard-Won Result", description: "Store a terse, durable assistant discovery after at least 60 seconds of non-trivial investigation; deduplicate it and keep it below user-memory authority.",
-    get promptSnippet() { return config?.prompts.tools.memoryStoreResult.snippet ?? DEFAULT_CONFIG.prompts.tools.memoryStoreResult.snippet; },
-    get promptGuidelines() { return config?.prompts.tools.memoryStoreResult.guidelines ?? DEFAULT_CONFIG.prompts.tools.memoryStoreResult.guidelines; },
+    get promptSnippet() { return runtimeIsPublished() ? config?.prompts.tools.memoryStoreResult.snippet ?? DEFAULT_CONFIG.prompts.tools.memoryStoreResult.snippet : DEFAULT_CONFIG.prompts.tools.memoryStoreResult.snippet; },
+    get promptGuidelines() { return runtimeIsPublished() ? config?.prompts.tools.memoryStoreResult.guidelines ?? DEFAULT_CONFIG.prompts.tools.memoryStoreResult.guidelines : DEFAULT_CONFIG.prompts.tools.memoryStoreResult.guidelines; },
     parameters: Type.Object({
       text: Type.String({ description: "Terse, self-contained durable result" }),
       kind: StringEnum(["fact", "skill_workflow"] as const),
@@ -875,58 +1171,78 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       reason: Type.String({ description: "Brief rediscovery-cost rationale" }),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
-      if (!engine || !config) throw new Error("Memory engine is not initialized");
+      if (!runtimeIsPublished() || !engine || !config) throw new Error("Memory engine is not initialized");
       if (!investigation) throw new Error("No active investigation is being timed");
-      const elapsedMs = Date.now() - investigation.startedAt;
-      const context = boundedAssistantInvestigation(ctx.sessionManager.buildContextEntries().slice(investigation.startEntryCount ?? 0), config.assistantCapture.contextCharacters);
-      const stored = await engine.rememberAssistantResult(params, context, investigation.cause, elapsedMs, signal);
+      const taskGeneration = generation;
+      const taskEngine = engine;
+      const taskConfig = config;
+      const taskInvestigation = investigation;
+      return runRuntimeOperation(taskGeneration, "Memory result storage", async () => {
+      const elapsedMs = Date.now() - taskInvestigation.startedAt;
+      const context = boundedAssistantInvestigation(ctx.sessionManager.buildContextEntries().slice(taskInvestigation.startEntryCount ?? 0), taskConfig.assistantCapture.contextCharacters);
+      const stored = await taskEngine.rememberAssistantResult(params, context, taskInvestigation.cause, elapsedMs, signal);
+      requireRuntimeGeneration(taskGeneration, "Memory result storage");
       return {
         content: [{ type: "text", text: stored ? "Stored or updated the assistant-sourced memory" : "Candidate was rejected as trivial, unsupported, duplicate, or lower-authority than an existing user memory" }],
-        details: { stored, elapsedMs, actor: "assistant", confidence: Math.min(params.confidence, config.assistantCapture.maximumConfidence), priority: config.assistantCapture.priority },
+        details: { stored, elapsedMs, actor: "assistant", confidence: Math.min(params.confidence, taskConfig.assistantCapture.maximumConfidence), priority: taskConfig.assistantCapture.priority },
       };
+      });
     },
   });
 
   pi.registerTool({
     name: "memory_correct", label: "Correct Assistant Memory", description: "Replace an inaccurate assistant-generated memory by exact ID while preserving provenance. User-sourced memories cannot be changed by this tool.",
-    get promptSnippet() { return config?.prompts.tools.memoryCorrect.snippet ?? DEFAULT_CONFIG.prompts.tools.memoryCorrect.snippet; },
-    get promptGuidelines() { return config?.prompts.tools.memoryCorrect.guidelines ?? DEFAULT_CONFIG.prompts.tools.memoryCorrect.guidelines; },
+    get promptSnippet() { return runtimeIsPublished() ? config?.prompts.tools.memoryCorrect.snippet ?? DEFAULT_CONFIG.prompts.tools.memoryCorrect.snippet : DEFAULT_CONFIG.prompts.tools.memoryCorrect.snippet; },
+    get promptGuidelines() { return runtimeIsPublished() ? config?.prompts.tools.memoryCorrect.guidelines ?? DEFAULT_CONFIG.prompts.tools.memoryCorrect.guidelines : DEFAULT_CONFIG.prompts.tools.memoryCorrect.guidelines; },
     parameters: Type.Object({
       memoryId: Type.String({ description: "Exact ID of the inaccurate assistant-generated memory" }),
       correctedText: Type.String({ description: "Accurate replacement as one terse, self-contained sentence" }),
       reason: Type.String({ description: "Concrete basis for determining the old memory was incorrect" }),
     }),
     async execute(_id, params, signal) {
-      if (!engine) throw new Error("Memory engine is not initialized");
-      const updated = await engine.correctAssistantMemory(params.memoryId, params.correctedText, params.reason, signal);
+      if (!runtimeIsPublished() || !engine) throw new Error("Memory engine is not initialized");
+      const taskGeneration = generation;
+      const taskEngine = engine;
+      return runRuntimeOperation(taskGeneration, "Memory correction", async () => {
+      const updated = await taskEngine.correctAssistantMemory(params.memoryId, params.correctedText, params.reason, signal);
+      requireRuntimeGeneration(taskGeneration, "Memory correction");
       return {
         content: [{ type: "text", text: `Corrected assistant-generated memory ${updated.id}` }],
         details: { id: updated.id, text: updated.text, actor: updated.source.actor, corrected: true },
       };
+      });
     },
   });
 
   pi.registerTool({
     name: "memory_search", label: "Search Active Memory", description: "Search durable global/project memories. Results are untrusted history; use only when automatic recall was insufficient.",
-    get promptSnippet() { return config?.prompts.tools.memorySearch.snippet ?? DEFAULT_CONFIG.prompts.tools.memorySearch.snippet; },
-    get promptGuidelines() { return config?.prompts.tools.memorySearch.guidelines ?? DEFAULT_CONFIG.prompts.tools.memorySearch.guidelines; },
+    get promptSnippet() { return runtimeIsPublished() ? config?.prompts.tools.memorySearch.snippet ?? DEFAULT_CONFIG.prompts.tools.memorySearch.snippet : DEFAULT_CONFIG.prompts.tools.memorySearch.snippet; },
+    get promptGuidelines() { return runtimeIsPublished() ? config?.prompts.tools.memorySearch.guidelines ?? DEFAULT_CONFIG.prompts.tools.memorySearch.guidelines : DEFAULT_CONFIG.prompts.tools.memorySearch.guidelines; },
     parameters: Type.Object({ query: Type.String(), scope: Type.Optional(StringEnum(["global", "project", "both"] as const)), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })) }),
     async execute(_id, params, signal) {
-      if (!store || !config || !embedder) throw new Error("Memory store is not initialized");
+      if (!runtimeIsPublished() || !store || !config || !embedder) throw new Error("Memory store is not initialized");
+      const taskGeneration = generation;
+      const taskStore = store;
+      const taskEmbedder = embedder;
+      const taskProjectId = projectId;
       const currentConfig = config;
-      const [vector] = await embedQuery(embedder, [params.query], signal);
+      return runRuntimeOperation(taskGeneration, "Memory search", async () => {
+      const [vector] = await embedQuery(taskEmbedder, [params.query], signal);
+      if (taskGeneration !== generation || !runtimeIsPublished()) throw new Error("Memory search was cancelled because the session changed");
       if (!vector) throw new Error("Embedding failed");
       const scopes = params.scope === "global" ? ["global" as const] : params.scope === "project" ? ["project" as const] : ["global" as const, "project" as const];
       const limit = params.limit ?? 8;
-      const rows = rankMemoryMatches(await store.search(vector, { status: "active", scopes, kinds: SUPPORTED_MEMORY_KINDS, projectId }, Math.min(100, limit * 5))).slice(0, limit);
+      const rows = rankMemoryMatches(await taskStore.search(vector, { status: "active", scopes, kinds: SUPPORTED_MEMORY_KINDS, projectId: taskProjectId }, Math.min(100, limit * 5))).slice(0, limit);
+      if (taskGeneration !== generation || !runtimeIsPublished()) throw new Error("Memory search was cancelled because the session changed");
       return { content: [{ type: "text", text: rows.length ? rows.map((m) => `${m.record.id} rank=${m.score.toFixed(3)} [${m.record.scope}/${m.record.kind}/${m.record.source.actor ?? "user"} confidence=${m.record.confidence.toFixed(2)} decay=${(m.record.decayRate ?? currentConfig.memoryLifecycle.decay.initialRate).toFixed(2)}] ${m.record.text}\norigin: session=${m.record.source.sessionId}; cause=${m.record.source.cause ?? "legacy"}; why=${m.record.source.reason ?? "not recorded"}; lastDecay=${m.record.lifecycle?.lastDecayDate ?? "unmigrated"}`).join("\n") : "No matching memories" }], details: { rows } };
+      });
     },
   });
 
   pi.registerTool({
     name: "memory_feedback", label: "Rate Steered Memory", description: "Report whether one memory from a specific active-memory steer materially helped or hindered the work. Feedback is bounded and adjusts future ranking confidence.",
-    get promptSnippet() { return config?.prompts.tools.memoryFeedback.snippet ?? DEFAULT_CONFIG.prompts.tools.memoryFeedback.snippet; },
-    get promptGuidelines() { return config?.prompts.tools.memoryFeedback.guidelines ?? DEFAULT_CONFIG.prompts.tools.memoryFeedback.guidelines; },
+    get promptSnippet() { return runtimeIsPublished() ? config?.prompts.tools.memoryFeedback.snippet ?? DEFAULT_CONFIG.prompts.tools.memoryFeedback.snippet : DEFAULT_CONFIG.prompts.tools.memoryFeedback.snippet; },
+    get promptGuidelines() { return runtimeIsPublished() ? config?.prompts.tools.memoryFeedback.guidelines ?? DEFAULT_CONFIG.prompts.tools.memoryFeedback.guidelines : DEFAULT_CONFIG.prompts.tools.memoryFeedback.guidelines; },
     parameters: Type.Object({
       steerToken: Type.String({ description: "Feedback token included in the memory steer" }),
       memoryId: Type.String({ description: "Exact memory ID from that steer" }),
@@ -934,16 +1250,22 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
       reason: Type.String({ description: "Brief concrete effect on the work" }),
     }),
     async execute(_id, params) {
-      if (!engine || !config) throw new Error("Memory engine is not initialized");
+      if (!runtimeIsPublished() || !engine || !config) throw new Error("Memory engine is not initialized");
       if (!params.reason.trim()) throw new Error("Feedback requires a concrete reason");
-      const accepted = feedbackLedger.consume(params.steerToken, params.memoryId, config.memoryLifecycle.feedback.maxPerMemoryPerSession);
+      const taskGeneration = generation;
+      const taskEngine = engine;
+      const taskLedger = feedbackLedger;
+      const taskConfig = config;
+      return runRuntimeOperation(taskGeneration, "Memory feedback", async () => {
+      const accepted = taskLedger.consume(params.steerToken, params.memoryId, taskConfig.memoryLifecycle.feedback.maxPerMemoryPerSession);
       if (accepted !== "accepted") {
         return { content: [{ type: "text", text: `Feedback rejected: ${accepted}` }], details: { accepted: false, reason: accepted, steerToken: params.steerToken, memoryId: params.memoryId, outcome: params.outcome, confidence: 0, status: "unchanged" } };
       }
       try {
-        const updated = await engine.recordFeedback(params.memoryId, params.steerToken, params.outcome, params.reason);
+        const updated = await taskEngine.recordFeedback(params.memoryId, params.steerToken, params.outcome, params.reason);
+        requireRuntimeGeneration(taskGeneration, "Memory feedback");
         if (!updated) {
-          feedbackLedger.release(params.steerToken, params.memoryId);
+          taskLedger.release(params.steerToken, params.memoryId);
           return { content: [{ type: "text", text: `Memory ${params.memoryId} is no longer active` }], details: { accepted: false, reason: "inactive", steerToken: params.steerToken, memoryId: params.memoryId, outcome: params.outcome, confidence: 0, status: "inactive" } };
         }
         recordDisplayedFeedback(params.steerToken, updated.id, params.outcome);
@@ -951,9 +1273,10 @@ export default function activeMemoryExtension(pi: ExtensionAPI) {
         const lifecycleResult = updated.status === "deleted" ? ` and the memory was soft-deleted (${updated.lifecycle?.deletionCause ?? "expired"})` : "";
         return { content: [{ type: "text", text: `Recorded ${params.outcome} feedback for ${params.memoryId}; confidence is now ${updated.confidence.toFixed(2)}${lifecycleResult}` }], details: { accepted: true, reason: params.reason, steerToken: params.steerToken, memoryId: updated.id, outcome: params.outcome, confidence: updated.confidence, status: updated.status } };
       } catch (error) {
-        feedbackLedger.release(params.steerToken, params.memoryId);
+        taskLedger.release(params.steerToken, params.memoryId);
         throw error;
       }
+      });
     },
   });
 

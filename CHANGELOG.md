@@ -1,3 +1,8 @@
+## Unreleased
+
+- Harden Qdrant alias generations, storage locking, embedding-generation guards, and cancellation cleanup.
+- Remove disabled publishing automation from this fork.
+
 ## [1.9.0](https://github.com/Rizhiy/pi-active-memory/compare/v1.8.0...v1.9.0) (2026-08-29)
 
 ## [1.8.0](https://github.com/Rizhiy/pi-active-memory/compare/v1.7.0...v1.8.0) (2026-08-26)

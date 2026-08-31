@@ -37,6 +37,13 @@ export function redactSecrets(text: string): string {
     .replace(/\b(password|api[_-]?key|secret|token)\s*[:=]\s*[^\s,;]{8,}/gi, "$1=[REDACTED]");
 }
 
+/** Redact before truncation so a long secret cannot leak a recognizable prefix. */
+export function sanitizePersistedText(value: string, maxCharacters: number, redact: boolean): string {
+  const sanitized = (redact ? redactSecrets(value.trim()) : value.trim());
+  if (!sanitized || /[\r\n]/.test(sanitized)) throw new Error("Memory text must be one non-empty line");
+  return sanitized.slice(0, maxCharacters);
+}
+
 export function textFromContent(content: unknown, includeThinking = false): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
