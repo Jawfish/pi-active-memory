@@ -81,6 +81,77 @@ test("built-in registry exposes independent rag, embedding, and llm adapters", a
   assert.equal(llm.selectedModel(), undefined);
 });
 
+test("OpenAI-compatible embeddings can resolve a Pi provider credential", async () => {
+  const requestedProviders: string[] = [];
+  const registry = createBuiltInAdapterRegistry();
+  const embedding = await registry.createEmbedding({
+    adapter: "openai-compatible",
+    config: { model: "voyage-4", baseUrl: "https://api.voyageai.com/v1", apiKeyProvider: "voyage" },
+  }, {
+    ...context,
+    extensionContext: {
+      modelRegistry: {
+        getApiKeyForProvider: async (provider: string) => {
+          requestedProviders.push(provider);
+          return "provider-secret";
+        },
+      },
+    },
+  } as never);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    assert.equal((init?.headers as Record<string, string>).authorization, "Bearer provider-secret");
+    return new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 0] }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  try {
+    assert.deepEqual(await embedDocuments(embedding, ["credential probe"]), [[1, 0]]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.deepEqual(requestedProviders, ["voyage"]);
+  assert.deepEqual(embeddingModels(embedding), { query: "openai-compatible/voyage-4", document: "openai-compatible/voyage-4" });
+});
+
+test("an explicitly configured embedding environment key takes precedence over Pi credentials", async () => {
+  const envName = "PI_ACTIVE_MEMORY_TEST_EMBEDDING_KEY";
+  const previous = process.env[envName];
+  process.env[envName] = "environment-secret";
+  let providerLookups = 0;
+  const registry = createBuiltInAdapterRegistry();
+  const embedding = await registry.createEmbedding({
+    adapter: "openai-compatible",
+    config: { model: "embed", baseUrl: "https://example.com/v1", apiKeyEnv: envName, apiKeyProvider: "fallback" },
+  }, {
+    ...context,
+    extensionContext: { modelRegistry: { getApiKeyForProvider: async () => { providerLookups++; return "provider-secret"; } } },
+  } as never);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    assert.equal((init?.headers as Record<string, string>).authorization, "Bearer environment-secret");
+    return new Response(JSON.stringify({ data: [{ index: 0, embedding: [1] }] }), { status: 200 });
+  };
+  try {
+    assert.deepEqual(await embedDocuments(embedding, ["environment probe"]), [[1]]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previous === undefined) delete process.env[envName]; else process.env[envName] = previous;
+  }
+  assert.equal(providerLookups, 0);
+});
+
+test("embedding credential selectors reject empty values", async () => {
+  const registry = createBuiltInAdapterRegistry();
+  await assert.rejects(
+    registry.createEmbedding({ adapter: "openai-compatible", config: { model: "embed", baseUrl: "https://example.com/v1", apiKeyProvider: " " } }, context as never),
+    /apiKeyProvider must be a non-empty string/,
+  );
+});
+
 test("Qdrant coordination cannot be split by configuration", async () => {
   const registry = createBuiltInAdapterRegistry();
   const first = await registry.createRag({ adapter: "qdrant", config: { url: "HTTP://QDRANT:80/", collection: "mem", lockPath: "/tmp/private-a" } }, context as never) as unknown as { lockPath: string; fencePath: string };

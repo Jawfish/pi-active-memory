@@ -92,15 +92,19 @@ export function createBuiltInAdapterRegistry(): AdapterRegistry {
   for (const provider of ["openai", "openai-compatible", "ollama"] as const) {
     registry.registerEmbedding(provider, async (config, context) => {
       const models = configuredEmbeddingModels(config);
+      const configuredApiKeyEnv = optionalString(config.apiKeyEnv, "providers.embedding.config.apiKeyEnv");
+      const configuredApiKeyProvider = optionalString(config.apiKeyProvider, "providers.embedding.config.apiKeyProvider");
+      const apiKeyEnv = configuredApiKeyEnv ?? (provider === "openai" ? "OPENAI_API_KEY" : undefined);
+      const apiKeyProvider = configuredApiKeyProvider ?? (provider === "openai" ? "openai" : undefined);
       const baseConfig = {
         provider,
         baseUrl: requiredString(config.baseUrl, "providers.embedding.config.baseUrl"),
-        ...(typeof config.apiKeyEnv === "string" ? { apiKeyEnv: config.apiKeyEnv } : {}),
+        ...(apiKeyEnv ? { apiKeyEnv } : {}),
+        ...(apiKeyProvider ? { apiKeyProvider } : {}),
         ...(typeof config.dimensions === "number" ? { dimensions: config.dimensions } : {}),
       };
-      const envName = baseConfig.apiKeyEnv ?? "OPENAI_API_KEY";
-      const resolvedApiKey = provider === "openai" && !process.env[envName]
-        ? await context.extensionContext.modelRegistry.getApiKeyForProvider("openai")
+      const resolvedApiKey = provider !== "ollama" && apiKeyProvider && !(apiKeyEnv && process.env[apiKeyEnv])
+        ? await context.extensionContext.modelRegistry.getApiKeyForProvider(apiKeyProvider)
         : undefined;
       const query = new Embedder({ ...baseConfig, model: models.query } satisfies EmbeddingConfig, resolvedApiKey);
       const document = models.document === models.query
@@ -136,6 +140,11 @@ function requiredString(value: unknown, path: string): string {
 function requiredNumber(value: unknown, path: string): number {
   if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${path} must be a finite number`);
   return value;
+}
+
+function optionalString(value: unknown, path: string): string | undefined {
+  if (value === undefined) return undefined;
+  return requiredString(value, path).trim();
 }
 
 function stringArray(value: unknown, path: string): string[] {

@@ -115,6 +115,7 @@ export interface EmbeddingConfig {
   model: string;
   baseUrl: string;
   apiKeyEnv?: string;
+  apiKeyProvider?: string;
   dimensions?: number;
 }
 

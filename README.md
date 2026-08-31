@@ -71,6 +71,8 @@ ChatGPT/Codex OAuth does **not** expose an embeddings endpoint. Therefore embedd
 
 Embedding calls made through the OpenAI API are separately billable. To avoid that, configure Ollama.
 
+OpenAI-compatible embeddings can set `apiKeyProvider` to a Pi provider ID and resolve its stored credential through Pi's model registry. If `apiKeyEnv` is also configured and populated, the environment value takes precedence; the Pi provider is the fallback. Credentials are resolved at runtime and are never copied into Active Memory configuration or embedding identity metadata.
+
 ### Database
 
 The default is a dependency-free, local JSON vector store at:
@@ -285,7 +287,7 @@ The Ollama chat model must also be configured in Pi's `models.json`.
       "config": {
         "model": "BAAI/bge-small-en-v1.5",
         "baseUrl": "https://embedding.example.com/v1",
-        "apiKeyEnv": "EMBEDDING_API_KEY"
+        "apiKeyProvider": "embedding-provider"
       }
     }
   }

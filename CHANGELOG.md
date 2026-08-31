@@ -1,6 +1,8 @@
 ## Unreleased
 
 - Harden Qdrant alias generations, storage locking, embedding-generation guards, and cancellation cleanup.
+- Show successful memory captures in the TUI transcript with Nerd Font iconography.
+- Allow OpenAI-compatible embeddings to resolve API keys from Pi provider credentials.
 - Remove disabled publishing automation from this fork.
 
 ## [1.9.0](https://github.com/Rizhiy/pi-active-memory/compare/v1.8.0...v1.9.0) (2026-08-29)

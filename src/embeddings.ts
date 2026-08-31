@@ -18,7 +18,15 @@ export class Embedder {
     }
 
     const key = (this.config.apiKeyEnv ? process.env[this.config.apiKeyEnv] : undefined) ?? this.resolvedApiKey;
-    if (!key) throw new Error(`Embedding provider requires $${this.config.apiKeyEnv ?? "OPENAI_API_KEY"}`);
+    if (!key) {
+      const sources = [
+        this.config.apiKeyEnv ? `$${this.config.apiKeyEnv}` : undefined,
+        this.config.apiKeyProvider ? `Pi provider ${this.config.apiKeyProvider}` : undefined,
+      ].filter((source): source is string => Boolean(source));
+      throw new Error(sources.length
+        ? `Embedding provider requires authentication from ${sources.join(" or ")}`
+        : "Embedding provider authentication is not configured");
+    }
     const response = await fetch(`${this.config.baseUrl.replace(/\/$/, "")}/embeddings`, {
       method: "POST", signal,
       headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
